@@ -330,7 +330,7 @@ def _current(
     return [
         {"kind": "tunnel_ingress", "ref": rule["hostname"], "props": dict(rule)}
         for rule in _tunnel_ingress(conf, client)
-        if rule["hostname"] == intent["hostname"]
+        if rule.get("hostname") == intent["hostname"]
     ] + [
         {
             "kind": "dns_record",
