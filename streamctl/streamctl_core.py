@@ -376,6 +376,14 @@ def destroy(conf: dict[str, str], name: str) -> dict[str, object]:
 # ---------- cf-router intent client (both backends, conf-selected) ----------
 
 
+def _router_url(conf: dict[str, str]) -> str:
+    """Conf-selected backend base URL; raises when routing is unset."""
+    router_url = (conf.get("STREAMCTL_ROUTER_URL") or "").rstrip("/")
+    if not router_url:
+        raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL unset in conf")
+    return router_url
+
+
 def _router_post(conf: dict[str, str], body: dict[str, object]) -> dict[str, object]:
     """Publish one signed routing intent; URL + secret from conf only."""
     import hashlib
@@ -383,9 +391,10 @@ def _router_post(conf: dict[str, str], body: dict[str, object]) -> dict[str, obj
     import json as _json
     import urllib.request
 
-    router_url = (conf.get("STREAMCTL_ROUTER_URL") or "").rstrip("/")
+    router_url = _router_url(conf)
     secret = conf.get("STREAMCTL_ROUTER_SECRET") or ""
-    if not router_url or not secret:
+    if not secret:
+        raise StreamctlError("routing requested but STREAMCTL_ROUTER_SECRET unset in conf")
         raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL/SECRET unset in conf")
     payload = dict(body)
     issued = int(time.time() * 1000)
@@ -402,6 +411,13 @@ def _router_post(conf: dict[str, str], body: dict[str, object]) -> dict[str, obj
         return _json.loads(resp.read().decode())
 
 
+def _route_hostname(conf: dict[str, str], app: dict[str, str]) -> str:
+    """The app's public hostname; re-derives from conf when the row predates a domain."""
+    if app["public_url"] != PUBLIC_URL_PLACEHOLDER:
+        return re.sub(r"^https?://", "", app["public_url"]).rstrip("/")
+    return re.sub(r"^https?://", "", _public_url(conf, app["name"])).rstrip("/")
+
+
 def publish_route(conf: dict[str, str], name: str, action: str = "create") -> dict[str, object]:
     """Sign+publish a routing intent for app NAME; returns the pending envelope."""
     app = get_app(conf, name)
@@ -412,7 +428,7 @@ def publish_route(conf: dict[str, str], name: str, action: str = "create") -> di
             "action": action,
             "target": "home",
             "app": name,
-            "hostname": re.sub(r"^https?://", "", app["public_url"]) if app["public_url"] != PUBLIC_URL_PLACEHOLDER else f"{name}.{conf['STREAMCTL_DOMAIN']}",
+            "hostname": _route_hostname(conf, app),
             "port": int(app["port"]),
         },
     )
@@ -423,9 +439,7 @@ def route_status(conf: dict[str, str], intent_id: str) -> dict[str, object]:
     import json as _json
     import urllib.request
 
-    router_url = (conf.get("STREAMCTL_ROUTER_URL") or "").rstrip("/")
-    if not router_url:
-        raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL unset in conf")
+    router_url = _router_url(conf)
     with urllib.request.urlopen(
         f"{router_url}{conf['STREAMCTL_ROUTER_INTENTS_PATH']}/{intent_id}",
         timeout=int(conf["PROBE_TIMEOUT"]),
