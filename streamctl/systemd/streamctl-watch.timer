@@ -1,0 +1,10 @@
+[Unit]
+Description=Run streamctl CI/CD watch tick every $STREAMCTL_WATCH_INTERVAL seconds
+
+[Timer]
+OnBootSec=$STREAMCTL_WATCH_ON_BOOT
+OnUnitActiveSec=$STREAMCTL_WATCH_INTERVAL
+AccuracySec=15s
+
+[Install]
+WantedBy=multi-user.target

@@ -52,6 +52,12 @@ def load_conf() -> dict[str, str]:
         "STREAMCTL_API_TOKEN": "",  # non-empty => mutating API calls require Bearer token
         "HEALTH_OK_CODES": "200|204",
         "PROBE_TIMEOUT": "8",
+        "STREAMCTL_GIT_LOCAL_SHA_CMD": "git -C {dir} rev-parse HEAD",
+        "STREAMCTL_GIT_REMOTE_SHA_CMD": "git -C {dir} ls-remote origin HEAD",
+        "STREAMCTL_WATCH_INTERVAL": "300",  # streamctl-watch.timer cadence
+        "STREAMCTL_WATCH_ON_BOOT": "2min",
+        "STREAMCTL_UNITDIR": "/etc/systemd/system",
+        "STREAMCTL_STATE_DIR": "/var/lib/streamctl",
     }
     path = Path(os.environ.get("STREAMCTL_CONF", DEFAULT_CONF))
     if path.is_file():
@@ -269,7 +275,9 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
     }
 
 
-def deploy(conf: dict[str, str], name: str, *, restart: bool = True) -> dict[str, object]:
+def deploy(
+    conf: dict[str, str], name: str, *, restart: bool = True
+) -> dict[str, object]:
     app = get_app(conf, name)
     appdir = Path(conf["STREAMCTL_ROOT"]) / name
     if (appdir / ".git").is_dir():
@@ -293,6 +301,59 @@ def status(conf: dict[str, str]) -> list[dict[str, object]]:
         code = http_code(conf, f"http://127.0.0.1:{r['port']}{HEALTH_PATH}")
         rows.append(dict(r, health=code, ok=ok_code(conf, code)))
     return rows
+
+
+def watch_tick(conf: dict[str, str]) -> dict[str, object]:
+    """One CI/CD pass: for every git-sourced app, deploy when origin HEAD moved.
+
+    Runs from streamctl-watch.timer (systemd), so there is no resident process
+    to hold memory or expose a port. Interval lives in STREAMCTL_WATCH_INTERVAL
+    (streamctl-watch.timer) - change conf, reinstall.
+    """
+    out: dict[str, object] = {
+        "checked": 0,
+        "deployed": [],
+        "unchanged": [],
+        "errors": [],
+    }
+    for row in load_apps(conf):
+        appdir = Path(conf["STREAMCTL_ROOT"]) / row["name"]
+        if not (appdir / ".git").is_dir():
+            continue
+        out["checked"] = int(out["checked"]) + 1  # type: ignore[operator]
+        state = Path(conf["STREAMCTL_STATE_DIR"]) / f"head-{row['name']}"
+        try:
+            sh(
+                conf,
+                conf["STREAMCTL_GIT_LOCAL_SHA_CMD"].format(
+                    dir=shlex.quote(str(appdir))
+                ),
+            )
+            remote = sh(
+                conf,
+                conf["STREAMCTL_GIT_REMOTE_SHA_CMD"].format(
+                    dir=shlex.quote(str(appdir))
+                ),
+            ).split("\t", 1)[0]
+        except StreamctlError as e:
+            out["errors"] = [*out["errors"], {"name": row["name"], "error": str(e)}]  # type: ignore[union-attr]
+            continue
+        if state.is_file() and state.read_text(encoding="utf-8").strip() == remote:
+            _watch_note(out, row["name"], "unchanged")
+            continue
+        try:
+            deploy(conf, row["name"])
+        except StreamctlError as e:
+            out["errors"] = [*out["errors"], {"name": row["name"], "error": str(e)}]  # type: ignore[union-attr]
+            continue
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(remote + "\n")
+        _watch_note(out, row["name"], "deployed")
+    return out
+
+
+def _watch_note(out: dict[str, object], name: str, kind: str) -> None:
+    out[kind] = [*(out.get(kind) or []), name]  # type: ignore[union-attr,assignment]
 
 
 def destroy(conf: dict[str, str], name: str) -> dict[str, object]:

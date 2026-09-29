@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,12 +25,38 @@ def fail(msg: str) -> None:
 
 USAGE = """streamctl create NAME SOURCE      create+boot an app (SOURCE: app dir or git url)
 streamctl deploy NAME              pull + pip sync + restart + health-check
+streamctl watch                    one CI/CD pass: deploy git apps whose origin HEAD moved
+streamctl install-watch            write+enable streamctl-watch timer (root; interval from conf)
 streamctl list                     status table for every app
 streamctl status NAME              one app's full record
 streamctl destroy NAME             stop unit, drop gsictl rows, delete appdir
 streamctl install-api              write+enable streamctl-api.service (root)
 streamctl serve                    run the HTTP API in foreground
 """
+
+SYSTEMD_SRC = _CORE_DIR / "systemd"
+
+
+def install_watch(conf: dict[str, str]) -> dict[str, object]:
+    """Render streamctl-watch.service/.timer from systemd/ templates with conf
+    values substituted, install, enable."""
+    import os
+
+    if os.geteuid() != 0:
+        raise core.StreamctlError("install-watch: run as root")
+    unitdir = Path(conf["STREAMCTL_UNITDIR"])
+    for unit in ("streamctl-watch.service", "streamctl-watch.timer"):
+        text = (SYSTEMD_SRC / unit).read_text(encoding="utf-8")
+        text = text.replace(
+            "$STREAMCTL_WATCH_INTERVAL", conf["STREAMCTL_WATCH_INTERVAL"]
+        ).replace("$STREAMCTL_WATCH_ON_BOOT", conf["STREAMCTL_WATCH_ON_BOOT"])
+        target = unitdir / unit
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(text)
+        tmp.replace(target)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "streamctl-watch.timer"], check=True)
+    return {"installed": True, "interval_sec": conf["STREAMCTL_WATCH_INTERVAL"]}
 
 
 def main(argv: list[str]) -> int:
@@ -47,6 +74,10 @@ def main(argv: list[str]) -> int:
             if len(rest) != 1:
                 fail("usage: streamctl deploy NAME")
             emit(core.deploy(conf, rest[0]))
+        elif cmd == "watch":
+            emit(core.watch_tick(conf))
+        elif cmd == "install-watch":
+            emit(install_watch(conf))
         elif cmd in ("list", "ls"):
             emit(core.status(conf))
         elif cmd == "status":

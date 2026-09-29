@@ -1,0 +1,9 @@
+[Unit]
+Description=streamctl CI/CD tick (deploy git-sourced apps whose origin HEAD moved)
+
+[Service]
+Type=oneshot
+User=dev
+# NoNewPrivileges stays OFF: the tick's deploy path needs `sudo -n systemctl`
+# (passwordless sudo for dev is house policy); NNP blocks sudo entirely.
+ExecStart=/usr/local/bin/streamctl watch

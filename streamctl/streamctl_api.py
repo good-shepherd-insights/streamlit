@@ -55,7 +55,9 @@ def one(name: str) -> dict[str, object]:
 
 
 @app.post("/apps")
-def create_app(body: dict[str, object], _: Annotated[None, Depends(auth)]) -> dict[str, object]:
+def create_app(
+    body: dict[str, object], _: Annotated[None, Depends(auth)]
+) -> dict[str, object]:
     name = str(body.get("name", ""))
     source = str(body.get("source", ""))
     return core.create(CONF, name, source)
