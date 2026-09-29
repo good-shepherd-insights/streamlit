@@ -354,6 +354,18 @@ extend-safe-fixes = ["TC002", "TC003"]
   "TRY",     # Ignore tryceratops rules (simpler exception handling in tests).
 ]
 "scripts/**" = ["T20", "INP", "PERF", "S", "TRY002"]
+"streamctl/**" = [
+  # streamctl is an ops controller, not app code: it drives other processes by
+  # design (gsictl/systemd/cloudflared hooks), binds the API for the LAN, and
+  # takes FastAPI/CLI-framework callback args it doesn't read.
+  "ARG",     # Framework callbacks carry unused args (FastAPI `request`, conf shims).
+  "EXE001",  # Core module is imported, not executed; shebang kept for direct use.
+  "PLW1510", # subprocess result handled manually (returncode is surfaced, not raised).
+  "PLW2901", # Loop var rebind is the conf-parsing pattern (strip then continue).
+  "RUF027",  # `%{http_code}` is a literal curl format string, not a missing f-prefix.
+  "S",       # Security-band rules: shell/subprocess/bind are the tool's job.
+  "T20",     # ops CLI prints results; print is the interface.
+]
 "lib/streamlit/.agents/**" = [
   # Each template is a standalone app, not a package. Adding __init__.py would
   # misrepresent them as importable modules.
@@ -451,6 +463,17 @@ module = "e2e_playwright.*"
 disallow_incomplete_defs = false
 disallow_untyped_calls = false
 disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = "streamctl.*"
+# Ops controller: FastAPI decorators and third-party process hooks carry loose
+# annotations; untyped calls into gsictl-managed processes are the tool's domain.
+disallow_untyped_decorators = false
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = "streamctl.streamctl_api"
+follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = "tests.*"
