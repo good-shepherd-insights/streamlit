@@ -252,6 +252,18 @@ async function cfMutation(
   return { ok: true, result: cfResp.result };
 }
 
+/** Single writable object (PUT): replace-with-computed ingress rules, dropping the given host. */
+async function putTunnelIngress(
+  cfg: Config,
+  doFetch: CfFetch,
+  dropHost: string | null,
+  addRule?: Record<string, unknown>,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const rules = (await currentIngressRules(cfg, doFetch)).filter((r) => r.hostname !== dropHost);
+  if (addRule) rules.push(addRule as { hostname: string; service: string });
+  return await cfMutation(doFetch, cfg.CF_TUNNEL_CONFIG_URL, "PUT", JSON.stringify({ config: { ingress: rules } }));
+}
+
 /** Apply one missing resource; 1-2 CF calls, retried up to APPLY_MAX_RETRIES. */
 async function createResource(
   intent: Intent,
@@ -262,14 +274,8 @@ async function createResource(
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const tryOnce = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
     switch (resource.kind) {
-      case "tunnel_ingress": {
-        // Tunnel configurations is one PUT object: merge ALL current rules
-        // (every host) with the new rule so foreign hosts survive.
-        const currentLive = await currentIngressRules(cfg, doFetch);
-        const ownHost = intent.hostname as string;
-        const rules = [...currentLive.filter((r) => r.hostname !== ownHost), resource.props];
-        return await cfMutation(doFetch, cfg.CF_TUNNEL_CONFIG_URL, "PUT", JSON.stringify({ config: { ingress: rules } }));
-      }
+      case "tunnel_ingress":
+        return await putTunnelIngress(cfg, doFetch, intent.hostname as string, resource.props);
       case "dns_record":
         return await cfMutation(doFetch, cfg.CF_DNS_RECORDS_URL, "POST", JSON.stringify(resource.props));
       case "container_instance":
@@ -326,11 +332,8 @@ export async function destroyResource(
   doFetch: CfFetch,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   switch (doomed.kind) {
-    case "tunnel_ingress": {
-      const currentLive = await currentIngressRules(cfg, doFetch);
-      const remaining = currentLive.filter((r) => r.hostname !== doomed.ref).map((r) => ({ ...r }));
-      return await cfMutation(doFetch, cfg.CF_TUNNEL_CONFIG_URL, "PUT", JSON.stringify({ config: { ingress: remaining } }));
-    }
+    case "tunnel_ingress":
+      return await putTunnelIngress(cfg, doFetch, doomed.ref);
     case "dns_record": {
       const liveId = current.find((r) => r.kind === "dns_record" && r.ref === doomed.ref)?.props.id;
       return await cfMutation(doFetch, `${cfg.CF_DNS_RECORDS_URL}/${liveId}`, "DELETE");

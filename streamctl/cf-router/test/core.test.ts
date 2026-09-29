@@ -14,22 +14,8 @@ import {
   type RouterStore,
 } from "../src/core.js";
 import { makeConf } from "./fixtures/conf.js";
+import { CFARGO_TARGET, dnsRecordBody, INTENT_ID, makeIntent, NOW, service, TEST_APP, TEST_DNS_ID, TEST_HOSTNAME, TEST_IMAGE, TEST_PORT, TEST_TUNNEL_ID } from "./fixtures/intent.js";
 import { recordingFetch, type MockResponse } from "./helpers.js";
-
-const NOW = 1_750_000_000_000;
-
-function makeIntent(overrides: Partial<Intent> = {}): Intent {
-  return {
-    id: "intent-1",
-    action: "create",
-    target: "home",
-    app: "ledger",
-    hostname: "ledger.apps.example.test",
-    port: 8502,
-    issued_at: NOW,
-    ...overrides,
-  };
-}
 
 // Route helper: answers every GET the core composes from conf URLs with
 // CF-shaped success empties (no ingress rules, no records, no instances).
@@ -54,13 +40,13 @@ describe("get_desired_state", () => {
     expect(kinds).toEqual(["tunnel_ingress", "dns_record"]);
     expect(state.desired[0]).toEqual({
       kind: "tunnel_ingress",
-      ref: "ledger.apps.example.test",
-      props: { hostname: "ledger.apps.example.test", service: "http://localhost:8502" },
+      ref: TEST_HOSTNAME,
+      props: { hostname: TEST_HOSTNAME, service: service() },
     });
     expect(state.desired[1]?.props).toEqual({
       type: "CNAME",
-      name: "ledger.apps.example.test",
-      content: `tun_test_789.cfargotunnel.com`,
+      name: TEST_HOSTNAME,
+      content: CFARGO_TARGET,
       proxied: true,
     });
     expect(state.current).toHaveLength(0);
@@ -69,7 +55,7 @@ describe("get_desired_state", () => {
       `${cfg.CF_TUNNEL_CONFIG_URL as string}`,
     );
     expect(mockFetch.calls[1]?.url).toBe(
-      `${cfg.CF_DNS_RECORDS_URL as string}?type=CNAME&name=ledger.apps.example.test`,
+      `${cfg.CF_DNS_RECORDS_URL as string}?type=CNAME&name=${TEST_HOSTNAME}`,
     );
   });
 
@@ -80,10 +66,10 @@ describe("get_desired_state", () => {
       {
         result: [
           {
-            id: "dns-42",
+            id: TEST_DNS_ID,
             type: "CNAME",
-            name: "ledger.apps.example.test",
-            content: "tun_test_789.cfargotunnel.com",
+            name: TEST_HOSTNAME,
+            content: CFARGO_TARGET,
             proxied: true,
           },
         ],
@@ -92,7 +78,7 @@ describe("get_desired_state", () => {
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/configurations"),
       {
-        result: { ingress: [{ hostname: "ledger.apps.example.test", service: "http://localhost:8502" }] },
+        result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
       },
     );
     mockFetch.respondTo(() => true, { result: null });
@@ -100,27 +86,27 @@ describe("get_desired_state", () => {
     const state = await get_desired_state(makeIntent(), makeConf(), mockFetch);
     expect(state.current).toHaveLength(2);
     const dns = state.current.find((r) => r.kind === "dns_record");
-    expect(dns?.props).toMatchObject({ id: "dns-42", type: "CNAME" });
+    expect(dns?.props).toMatchObject({ id: TEST_DNS_ID, type: "CNAME" });
   });
 
   it("container target: desired is the instance row, current read by app", async () => {
     const mockFetch = recordingFetch();
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/containers"),
-      { result: [{ name: "ledger", image: "registry.test/ledger:v7", status: "healthy" }] },
+      { result: [{ name: TEST_APP, image: TEST_IMAGE, status: "healthy" }] },
     );
     mockFetch.respondTo(() => true, { result: null });
 
     const state = await get_desired_state(
-      makeIntent({ target: "container", container_image: "registry.test/ledger:v7", hostname: undefined }),
+      makeIntent({ target: "container", container_image: TEST_IMAGE, hostname: undefined }),
       makeConf(),
       mockFetch,
     );
     expect(state.desired).toEqual([
       {
         kind: "container_instance",
-        ref: "ledger",
-        props: { name: "ledger", image: "registry.test/ledger:v7" },
+        ref: TEST_APP,
+        props: { name: TEST_APP, image: TEST_IMAGE },
       },
     ]);
     expect(state.current).toHaveLength(1);
@@ -152,7 +138,7 @@ describe("apply_create (diff-based, idempotent)", () => {
     expect(result.existing).toHaveLength(0);
     expect(result.failed_reason).toBeUndefined();
     expect(result.audit).toHaveLength(1);
-    expect(result.audit[0]).toMatchObject({ action: "create", app: "ledger" });
+    expect(result.audit[0]).toMatchObject({ action: "create", app: TEST_APP });
 
     // One PUT for tunnel config, one POST for the CNAME.
     expect(mockFetch.calls.filter((c) => c.method === "PUT")).toHaveLength(1);
@@ -183,10 +169,10 @@ describe("apply_create (diff-based, idempotent)", () => {
       {
         result: [
           {
-            id: "dns-42",
+            id: TEST_DNS_ID,
             type: "CNAME",
-            name: "ledger.apps.example.test",
-            content: "tun_test_789.cfargotunnel.com",
+            name: TEST_HOSTNAME,
+            content: CFARGO_TARGET,
             proxied: true,
           },
         ],
@@ -195,7 +181,7 @@ describe("apply_create (diff-based, idempotent)", () => {
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/configurations"),
       {
-        result: { ingress: [{ hostname: "ledger.apps.example.test", service: "http://localhost:8502" }] },
+        result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
       },
     );
     mockFetch.respondTo(() => true, { result: null });
@@ -234,7 +220,7 @@ describe("apply_create (diff-based, idempotent)", () => {
     expect(ingress).toEqual(
       expect.arrayContaining([
         { hostname: "other.apps.example.test", service: "http://other:8500" },
-        { hostname: "ledger.apps.example.test", service: "http://localhost:8502" },
+        { hostname: TEST_HOSTNAME, service: service() },
       ]),
     );
     expect(result.status).toBe("done");
@@ -248,10 +234,10 @@ describe("apply_create (diff-based, idempotent)", () => {
       {
         result: [
           {
-            id: "dns-42",
+            id: TEST_DNS_ID,
             type: "CNAME",
-            name: "ledger.apps.example.test",
-            content: "tun_test_789.cfargotunnel.com",
+            name: TEST_HOSTNAME,
+            content: CFARGO_TARGET,
             proxied: true,
           },
         ],
@@ -301,7 +287,7 @@ describe("apply_create (diff-based, idempotent)", () => {
       (callsSoFar) =>
         callsSoFar < 2
           ? { ok: false, errors: [{ code: 9103, message: "transient" }] }
-          : { result: { id: "dns-42" } },
+          : { result: { id: TEST_DNS_ID } },
     );
 
     const state = await get_desired_state(makeIntent(), cfg, mockFetch);
@@ -336,10 +322,10 @@ describe("apply_destroy (inverse diff)", () => {
       {
         result: [
           {
-            id: "dns-42",
+            id: TEST_DNS_ID,
             type: "CNAME",
-            name: "ledger.apps.example.test",
-            content: "tun_test_789.cfargotunnel.com",
+            name: TEST_HOSTNAME,
+            content: CFARGO_TARGET,
             proxied: true,
           },
         ],
@@ -348,7 +334,7 @@ describe("apply_destroy (inverse diff)", () => {
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/configurations"), {
       result: {
         ingress: [
-          { hostname: "ledger.apps.example.test", service: "http://localhost:8502" },
+          { hostname: TEST_HOSTNAME, service: service() },
           { hostname: "other.apps.example.test", service: "http://other:8500" },
         ],
       },
@@ -369,7 +355,7 @@ describe("apply_destroy (inverse diff)", () => {
     expect(JSON.parse(put?.body as string).config.ingress).toEqual([
       { hostname: "other.apps.example.test", service: "http://other:8500" },
     ]);
-    expect(result.audit[0]).toMatchObject({ action: "destroy", app: "ledger" });
+    expect(result.audit[0]).toMatchObject({ action: "destroy", app: TEST_APP });
   });
 
   it("is idempotent: destroying when nothing exists does zero mutations", async () => {
@@ -386,7 +372,7 @@ describe("apply_destroy (inverse diff)", () => {
 
 describe("intent_status", () => {
   const rows: IntentRecord[] = [
-    { id: "intent-1", status: "done", intent: makeIntent(), hostname: "ledger.apps.example.test" },
+    { id: INTENT_ID, status: "done", intent: makeIntent(), hostname: TEST_HOSTNAME },
   ];
   const store: RouterStore = {
     read: async (id) => rows.find((r) => r.id === id),
@@ -395,7 +381,7 @@ describe("intent_status", () => {
   };
 
   it("returns the store row by id", async () => {
-    const row = await intent_status("intent-1", store);
+    const row = await intent_status(INTENT_ID, store);
     expect(row?.status).toBe("done");
   });
 
@@ -412,7 +398,7 @@ describe("reconcile", () => {
     const writes: IntentRecord[] = [];
     const store: RouterStore = {
       read: async () => undefined,
-      where: async () => [{ id: "intent-1", status: "done", intent: makeIntent() }],
+      where: async () => [{ id: INTENT_ID, status: "done", intent: makeIntent() }],
       write: async (row) => {
         writes.push(row);
       },
@@ -420,7 +406,7 @@ describe("reconcile", () => {
 
     const summary = await reconcile(cfg, store, mockFetch);
     expect(summary.checked).toBe(1);
-    expect(summary.repaired).toEqual(["intent-1"]);
+    expect(summary.repaired).toEqual([INTENT_ID]);
     expect(mockFetch.calls.filter((c) => c.method === "POST")).toHaveLength(1);
     expect(mockFetch.calls.filter((c) => c.method === "PUT")).toHaveLength(1);
     expect(writes[0]?.status).toBe("done");
@@ -434,22 +420,22 @@ describe("reconcile", () => {
       {
         result: [
           {
-            id: "dns-42",
+            id: TEST_DNS_ID,
             type: "CNAME",
-            name: "ledger.apps.example.test",
-            content: "tun_test_789.cfargotunnel.com",
+            name: TEST_HOSTNAME,
+            content: CFARGO_TARGET,
             proxied: true,
           },
         ],
       },
     );
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/configurations"), {
-      result: { ingress: [{ hostname: "ledger.apps.example.test", service: "http://localhost:8502" }] },
+      result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
     });
     mockFetch.respondTo(() => true, { result: null });
     const store: RouterStore = {
       read: async () => undefined,
-      where: async () => [{ id: "intent-1", status: "done", intent: makeIntent() }],
+      where: async () => [{ id: INTENT_ID, status: "done", intent: makeIntent() }],
       write: async () => undefined,
     };
 
