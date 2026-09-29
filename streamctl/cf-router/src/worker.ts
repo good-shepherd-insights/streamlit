@@ -29,9 +29,11 @@ import {
   type IntentRecord,
   type IntentStatus,
   type RouterStore,
+  type CfFetch,
 } from "./core.js";
 import { loadConf, type Config } from "./conf.js";
 import { makeKvStore, type RouterKV } from "./store.js";
+import { consumeBatch, type ConsumerDeps } from "./queue-consumer.js";
 import { scheduledReconcile } from "./reconcile.js";
 
 /** Queues producer binding; the signed intent is the message body. */
@@ -160,17 +162,27 @@ export async function handleFetch(request: Request, deps: WorkerDeps): Promise<R
   return jsonResponse({ error: `method not allowed: ${request.method} ${path}` }, 405);
 }
 
-/** Assemble the Worker handlers from the runtime env (vars + bindings). */
-export function makeWorker(env: Record<string, unknown>): {
+/** CF credentials ride in a Worker SECRET; every outbound API fetch gets it. */
+export function authedFetch(token: string): CfFetch {
+  return (url, init) => fetch(url, { ...init, headers: { ...init?.headers, authorization: `Bearer ${token}` } });
+}
+
+/** Assemble the worker runtime from env: vars + bindings + CF_API_KEY secret. */
+export function makeWorker(
+  env: Record<string, unknown>,
+  extra?: { doFetch?: CfFetch; token?: string },
+): {
   fetch: (request: Request) => Promise<Response>;
-  scheduled: () => Promise<{ checked: number; repaired: string[] }>;
+  scheduled: (controller?: ScheduledEvent, ctx?: ExecutionContext) => Promise<void>;
+  queue?: (batch: MessageBatch<unknown>) => Promise<void>;
 } {
+  const token = extra?.token ?? (env["CF_API_KEY"] as string | undefined);
+  if (!token) throw new Error("missing required secret: CF_API_KEY");
+  const doFetch = extra?.doFetch ?? authedFetch(token);
   const queue = env["QUEUE"];
   if (queue === undefined) throw new Error("missing required binding: QUEUE");
   const kv = env["INTENTS_KV"];
   if (kv === undefined) throw new Error("missing required binding: INTENTS_KV");
-  const cfg = loadConf(env);
-  const store = makeKvStore(kv as RouterKV);
   const deps: WorkerDeps = { cfg, store, queue: queue as QueueProducer };
   return {
     fetch: (request) => handleFetch(request, deps),

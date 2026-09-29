@@ -1,0 +1,27 @@
+# Backend A (CF Worker) - wrangler config. Values from live CF probes 2026-09-29:
+# zone marylandinsights.com 2704c01e2a34292e7f258f49f748861b, acct 4972acce5..., tunnel maryland-streamctl (conf file holds it).
+name = "cf-router"
+main = "src/worker.ts"
+compatibility_date = "2026-09-01"
+
+[vars]
+CF_ZONE_ID = "2704c01e2a34292e7f258f49f748861b"
+CF_ACCOUNT_ID = "4972acce5fc1e4032d8bcc8375fb4c42"
+CF_TUNNEL_ID = "861baa10-37aa-4517-b788-3f4a5ec2e57e"
+PUBLIC_DOMAIN = "marylandinsights.com"
+API_HOSTNAME = "router.marylandinsights.com"
+REPLAY_WINDOW_SEC = "300"
+APPLY_MAX_RETRIES = "3"
+TUNNEL_SERVICE_PREFIX = "http://localhost:"
+
+[[queues.producers]]
+queue = "cf-router-apply"
+
+[[queues.consumers]]
+queue = "cf-router-apply"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "cf-router-dlq"
+
+[[triggers]]
+crons = ["*/15 * * * *"]
