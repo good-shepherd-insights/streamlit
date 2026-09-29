@@ -47,7 +47,7 @@ function seedEmptyReads(mockFetch: ReturnType<typeof recordingFetch>) {
     (_url, method) => method === "GET",
     (_n, call): MockResponse => {
       if (call.url.includes("/dns_records")) return { result: [] };
-      if (call.url.includes("/configurations")) return { result: { ingress: [] } };
+      if (call.url.includes("/configurations")) return { result: { config: { ingress: [] } } };
       if (call.url.includes("/containers")) return { result: [] };
       return { result: null };
     },
@@ -385,7 +385,7 @@ describe("scheduled reconcile over the KV store", () => {
       (_n, call): MockResponse => {
         if (call.url.includes("/dns_records")) return { result: [] };
         if (call.url.includes("/configurations")) {
-          return { result: { ingress: [{ hostname: TEST_HOSTNAME, service: service(TEST_PORT) }] } };
+          return { result: { config: { ingress: [{ hostname: TEST_HOSTNAME, service: service(TEST_PORT) }] } } };
         }
         return { result: null };
       },

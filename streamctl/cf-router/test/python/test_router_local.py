@@ -66,7 +66,7 @@ def ingest(ingress: list, dns: list):
     def respond(prior, call):
         if "/dns_records" in str(call["url"]):
             return {"result": dns}
-        return {"result": {"ingress": ingress}}
+        return {"result": {"config": {"ingress": ingress}}}
 
     return respond
 

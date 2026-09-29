@@ -153,6 +153,6 @@ def seed_empty_reads(cf: RecordingCf) -> None:
         lambda prior, call: (
             {"result": []}
             if "/dns_records" in str(call["url"])
-            else {"result": {"ingress": []}}
+            else {"result": {"config": {"ingress": []}}}
         ),
     )

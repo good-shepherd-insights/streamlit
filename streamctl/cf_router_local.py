@@ -329,7 +329,7 @@ def _current(
     )
     return [
         {"kind": "tunnel_ingress", "ref": rule["hostname"], "props": dict(rule)}
-        for rule in (tunnel.get("ingress") or [])
+        for rule in _tunnel_ingress(conf, client)
         if rule["hostname"] == intent["hostname"]
     ] + [
         {
@@ -373,6 +373,15 @@ def _dns_ids(
     ]
 
 
+def _tunnel_ingress(
+    conf: dict[str, str], client: httpx.Client
+) -> list[dict[str, object]]:
+    """Live ingress rules - config lives under result.config (CF v4 shape)."""
+    result = cf_json(client, conf, conf["CF_TUNNEL_CONFIG_URL"]) or {}
+    cfg_obj = result.get("config") if isinstance(result, dict) else None
+    return list((cfg_obj or {}).get("ingress") or [])
+
+
 def _put_ingress(
     conf: dict[str, str],
     client: httpx.Client,
@@ -380,18 +389,22 @@ def _put_ingress(
     add: dict | None = None,
 ) -> None:
     """Single writable object (core.ts putTunnelIngress): replace-with-computed
-    rules, merging ALL existing ingress hosts before dropping/adding.
-    """
-    rules = [
+    rules, merging ALL existing ingress hosts before dropping/adding. App rules
+    insert BEFORE the catchall (last rule must remain hostname-less)."""
+    rules: list[dict[str, object]] = [
         {"hostname": rule["hostname"], "service": rule["service"]}
-        for rule in (
-            (cf_json(client, conf, conf["CF_TUNNEL_CONFIG_URL"]) or {}).get("ingress")
-            or []
-        )
-        if rule["hostname"] != drop
+        for rule in _tunnel_ingress(conf, client)
+        if rule.get("hostname")  # hostful app rules first...
     ]
+    catchall = next(
+        (r for r in _tunnel_ingress(conf, client) if not r.get("hostname")), None
+    )
+    rules = [r for r in rules if r.get("hostname") != drop]
+    if catchall:
+        rules.append(catchall)  # ...catchall last, preserved verbatim
     if add:
-        rules.append(add)  # type: ignore[arg-type]
+        insert = len(rules) - (1 if catchall else 0)
+        rules = [*rules[:insert], add, *rules[insert:]]  # type: ignore[list-item]
     cf_json(
         client,
         conf,

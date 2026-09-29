@@ -22,7 +22,7 @@ import { recordingFetch, type MockResponse } from "./helpers.js";
 function seedEmptyReads(url: string, method: string): MockResponse {
   if (method !== "GET") return { result: null };
   if (url.includes("/dns_records")) return { result: [] };
-  if (url.includes("/configurations")) return { result: { ingress: [] } };
+  if (url.includes("/configurations")) return { result: { config: { ingress: [] } } };
   if (url.includes("/containers")) return { result: [] };
   return { result: null };
 }
@@ -78,7 +78,7 @@ describe("get_desired_state", () => {
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/configurations"),
       {
-        result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
+        result: { config: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] } },
       },
     );
     mockFetch.respondTo(() => true, { result: null });
@@ -181,7 +181,7 @@ describe("apply_create (diff-based, idempotent)", () => {
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/configurations"),
       {
-        result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
+        result: { config: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] } },
       },
     );
     mockFetch.respondTo(() => true, { result: null });
@@ -206,7 +206,7 @@ describe("apply_create (diff-based, idempotent)", () => {
     const mockFetch = recordingFetch();
     mockFetch.respondTo(
       (url, method) => method === "GET" && url.includes("/configurations"),
-      { result: { ingress: [{ hostname: "other.apps.example.test", service: "http://other:8500" }] } },
+      { result: { config: { ingress: [{ hostname: "other.apps.example.test", service: "http://other:8500" }] } } },
     );
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/dns_records"), { result: [] });
     mockFetch.respondTo(() => true, { result: null });
@@ -244,7 +244,7 @@ describe("apply_create (diff-based, idempotent)", () => {
       },
     );
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/configurations"), {
-      result: { ingress: [] },
+      result: { config: { ingress: [] } },
     });
     mockFetch.respondTo(() => true, { result: null });
 
@@ -333,10 +333,12 @@ describe("apply_destroy (inverse diff)", () => {
     );
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/configurations"), {
       result: {
-        ingress: [
-          { hostname: TEST_HOSTNAME, service: service() },
-          { hostname: "other.apps.example.test", service: "http://other:8500" },
-        ],
+        config: {
+          ingress: [
+            { hostname: TEST_HOSTNAME, service: service() },
+            { hostname: "other.apps.example.test", service: "http://other:8500" },
+          ],
+        },
       },
     });
     mockFetch.respondTo(() => true, { result: null });
@@ -430,7 +432,7 @@ describe("reconcile", () => {
       },
     );
     mockFetch.respondTo((url, method) => method === "GET" && url.includes("/configurations"), {
-      result: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] },
+      result: { config: { ingress: [{ hostname: TEST_HOSTNAME, service: service() }] } },
     });
     mockFetch.respondTo(() => true, { result: null });
     const store: RouterStore = {

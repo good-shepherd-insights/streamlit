@@ -218,7 +218,8 @@ export async function get_desired_state(
       .map((i) => ({ kind: "container_instance" as const, ref: i.name, props: { name: i.name, image: i.image } }));
   } else if (intent.target === "home") {
     const tunnel = await cfJson(doFetch, cfg.CF_TUNNEL_CONFIG_URL);
-    const ingress = ((tunnel.result as { ingress?: { hostname: string; service: string }[] } | undefined)?.ingress ?? [])
+    const tunnelCfg = (tunnel.result as { config?: { ingress?: { hostname: string; service: string }[] } } | undefined)?.config;
+    const ingress = ((tunnelCfg?.ingress ?? []) as { hostname: string; service: string }[])
       .filter((rule) => rule.hostname === intent.hostname)
       .map((rule) => ({ kind: "tunnel_ingress" as const, ref: rule.hostname, props: { ...rule } }));
     const dnsResp = await cfJson(
@@ -253,7 +254,8 @@ export async function get_desired_state(
 /** Live read of ALL ingress rules on the tunnel (every host) for merge-on-write. */
 async function currentIngressRules(cfg: Config, doFetch: CfFetch): Promise<{ hostname: string; service: string }[]> {
   const tunnel = await cfJson(doFetch, cfg.CF_TUNNEL_CONFIG_URL);
-  return ((tunnel.result as { ingress?: { hostname: string; service: string }[] } | undefined)?.ingress ?? []).map(
+  const tunnelCfg = (tunnel.result as { config?: { ingress?: { hostname: string; service: string }[] } } | undefined)?.config;
+  return ((tunnelCfg?.ingress ?? []) as { hostname: string; service: string }[]).map(
     (rule) => ({ hostname: rule.hostname, service: rule.service }),
   );
 }
