@@ -30,6 +30,7 @@ export const RAW_CONF: Record<string, string> = {
   // A route path the router must never dispatch (negative path-composition case).
   UNROUTED_PATH: "/unrouted/paths",
   HMAC_SECRET: "test-hmac-secret",
+  CF_API_KEY: "test-cf-api-key",
   REPLAY_WINDOW_SEC: "300",
   ROUTE_WAIT_SEC: "30",
   APPLY_MAX_RETRIES: "3",

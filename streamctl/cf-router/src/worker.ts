@@ -183,9 +183,19 @@ export function makeWorker(
   if (queue === undefined) throw new Error("missing required binding: QUEUE");
   const kv = env["INTENTS_KV"];
   if (kv === undefined) throw new Error("missing required binding: INTENTS_KV");
-  const deps: WorkerDeps = { cfg, store, queue: queue as QueueProducer };
+  const cfg = loadConf(env);
+  const store = makeKvStore(kv as RouterKV);
+  const consumer: ConsumerDeps = { cfg, store, doFetch };
   return {
-    fetch: (request) => handleFetch(request, deps),
-    scheduled: () => scheduledReconcile({ cfg, store, doFetch: (url, init) => fetch(url, init) }),
+    fetch: (request) => handleFetch(request, { cfg, store, queue: queue as QueueProducer }),
+    scheduled: async () => {
+      await scheduledReconcile({ cfg, store, doFetch });
+    },
+    queue: async (batch) => {
+      await consumeBatch(
+        { messages: batch.messages.map((m) => ({ body: m.body, attempts: m.attempts ?? 0 })) },
+        consumer,
+      );
+    },
   };
 }
