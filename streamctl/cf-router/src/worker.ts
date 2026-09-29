@@ -173,7 +173,7 @@ export function makeWorker(
   extra?: { doFetch?: CfFetch; token?: string },
 ): {
   fetch: (request: Request) => Promise<Response>;
-  scheduled: (controller?: ScheduledEvent, ctx?: ExecutionContext) => Promise<void>;
+  scheduled: (controller?: Partial<ScheduledEvent>, ctx?: ExecutionContext) => Promise<void>;
   queue?: (batch: MessageBatch<unknown>) => Promise<void>;
 } {
   const token = extra?.token ?? (env["CF_API_KEY"] as string | undefined);
@@ -199,3 +199,25 @@ export function makeWorker(
     },
   };
 }
+
+/** Wrangler module entry: fetch/scheduled/queue handlers composed from env. */
+export default {
+  async fetch(request: Request, env: Record<string, unknown>): Promise<Response> {
+    return (await makeWorker(env).fetch(request)) as Response;
+  },
+  async scheduled(
+    controller: ScheduledController,
+    env: Record<string, unknown>,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    const worker = makeWorker(env);
+    if (worker.scheduled) await worker.scheduled({ cron: (controller as unknown as { cron?: string }).cron ?? "" });
+  },
+  async queue(
+    batch: MessageBatch<unknown>,
+    env: Record<string, unknown>,
+  ): Promise<void> {
+    const worker = makeWorker(env);
+    if (worker.queue) await worker.queue(batch);
+  },
+};
