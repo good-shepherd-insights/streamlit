@@ -1,0 +1,16 @@
+[Unit]
+Description=streamctl HTTP API (GSI Streamlit fleet controller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+ExecStart=/usr/bin/python3 /usr/local/lib/streamctl/streamctl_api.py
+Restart=always
+RestartSec=5s
+# NoNewPrivileges stays OFF: the API's mutating calls need `sudo -n systemctl`
+# for daemon-reload/unit mgmt (passwordless sudo for dev is house policy).
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""streamctl - CLI surface over streamctl_core. Same verbs as the HTTP API."""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+_CORE_DIR = Path(__file__).resolve().parent
+if str(_CORE_DIR) == "/usr/local/bin":  # installed copy: core lives in /usr/local/lib/streamctl
+    _CORE_DIR = Path("/usr/local/lib/streamctl")
+sys.path.insert(0, str(_CORE_DIR))
+import streamctl_core as core  # noqa: E402
+
+
+def emit(obj: object) -> None:
+    print(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def fail(msg: str) -> None:
+    print(f"streamctl: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+USAGE = """streamctl create NAME SOURCE      create+boot an app (SOURCE: app dir or git url)
+streamctl deploy NAME              pull + pip sync + restart + health-check
+streamctl list                     status table for every app
+streamctl status NAME              one app's full record
+streamctl destroy NAME             stop unit, drop gsictl rows, delete appdir
+streamctl install-api              write+enable streamctl-api.service (root)
+streamctl serve                    run the HTTP API in foreground
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE, end="")
+        return 2
+    conf = core.load_conf()
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "create":
+            if len(rest) != 2:
+                fail("usage: streamctl create NAME SOURCE")
+            emit(core.create(conf, rest[0], rest[1]))
+        elif cmd == "deploy":
+            if len(rest) != 1:
+                fail("usage: streamctl deploy NAME")
+            emit(core.deploy(conf, rest[0]))
+        elif cmd in ("list", "ls"):
+            emit(core.status(conf))
+        elif cmd == "status":
+            if len(rest) != 1:
+                fail("usage: streamctl status NAME")
+            emit(core.get_app(conf, rest[0]))
+        elif cmd == "destroy":
+            if len(rest) != 1:
+                fail("usage: streamctl destroy NAME")
+            emit(core.destroy(conf, rest[0]))
+        else:
+            emit({"error": f"unknown command: {cmd}"})
+            return 2
+        return 0
+    except core.StreamctlError as e:
+        fail(str(e))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
