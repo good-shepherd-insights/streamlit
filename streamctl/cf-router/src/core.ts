@@ -167,7 +167,7 @@ function desired_for(intent: Intent, cfg: Config): Resource[] {
     {
       kind: "tunnel_ingress",
       ref: intent.hostname as string,
-      props: { hostname: intent.hostname, service: `http://localhost:${intent.port}` },
+      props: { hostname: intent.hostname, service: `${cfg.TUNNEL_SERVICE_PREFIX}${intent.port}` },
     },
     {
       kind: "dns_record",

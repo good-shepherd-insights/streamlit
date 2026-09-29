@@ -16,6 +16,7 @@ export interface Config {
   CF_TUNNEL_CONFIG_URL: string;
   CF_CONTAINER_URL: string;
   // routing/auth/timing (same shape on both backends)
+  TUNNEL_SERVICE_PREFIX: string;
   PUBLIC_DOMAIN: string;
   API_HOSTNAME: string;
   HMAC_SECRET: string;
@@ -98,6 +99,7 @@ export function loadConf(input: string | Record<string, string>): Config {
       raw.CF_TUNNEL_CONFIG_URL ??
       `${CF_API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/configurations`,
     CF_CONTAINER_URL: raw.CF_CONTAINER_URL ?? `${CF_API_BASE}/accounts/${CF_ACCOUNT_ID}/containers/apps`,
+    TUNNEL_SERVICE_PREFIX: raw.TUNNEL_SERVICE_PREFIX ?? `http://localhost:`,
     PUBLIC_DOMAIN: cf2.PUBLIC_DOMAIN,
     API_HOSTNAME: cf2.API_HOSTNAME,
     HMAC_SECRET: cf2.HMAC_SECRET,
