@@ -1,0 +1,21 @@
+[Unit]
+Description=streamctl routes (cf-router Backend B: FastAPI intent router over uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+# uvicorn runs from cf_router_local.main(); bind/port are read from
+# streamctl.conf (STREAMCTL_ROUTER_BIND / STREAMCTL_ROUTER_PORT), never
+# hardcoded here. The conf comes from /etc/streamctl/streamctl.conf or
+# $STREAMCTL_CONF via cf_router_local.load_conf().
+ExecStart=/usr/bin/python3 /usr/local/lib/streamctl/cf_router_local.py
+Restart=always
+RestartSec=5s
+# NoNewPrivileges stays OFF: intent applies mutate Cloudflare over HTTPS and
+# share the house sudo policy with streamctl-api; the CF API key lives only
+# in the 0600 file named by conf CF_API_KEY_FILE.
+
+[Install]
+WantedBy=multi-user.target
