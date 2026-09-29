@@ -1,3 +1,19 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // cf-router shared config — PRD 5b.i.
 // The ONLY place conf key names are defined. Both backends (Worker wrangler
 // vars, homeserver streamctl.conf) reuse the same key names so switching
@@ -19,6 +35,9 @@ export interface Config {
   TUNNEL_SERVICE_PREFIX: string;
   PUBLIC_DOMAIN: string;
   API_HOSTNAME: string;
+  // Router API route root; composed onto API_HOSTNAME by the I/O adapters so
+  // no adapter ever spells the route literal itself.
+  INTENTS_PATH: string;
   HMAC_SECRET: string;
   REPLAY_WINDOW_SEC: number;
   ROUTE_WAIT_SEC: number;
@@ -66,13 +85,20 @@ function parseConfFile(body: string): Record<string, string> {
 
 /**
  * Load the shared Config from an env-style record (wrangler vars / env
- * object) or from a key=value file body. Unknown keys are ignored. A
- * supplied CF_*_URL wins; otherwise the endpoint is composed from
- * CF_API_BASE + the zone/account/tunnel ids.
+ * object, possibly carrying non-string bindings, which are ignored) or
+ * from a key=value file body. Unknown keys are ignored. A supplied
+ * CF_*_URL / INTENTS_PATH wins; otherwise the value is composed from the
+ * identity fields above.
  */
-export function loadConf(input: string | Record<string, string>): Config {
+export function loadConf(input: string | Record<string, unknown>): Config {
   const raw: Record<string, string> =
-    typeof input === "string" ? parseConfFile(input) : { ...input };
+    typeof input === "string"
+      ? parseConfFile(input)
+      : // Bindings (KV namespaces, queues) ride on the same env object as the
+        // vars; only the string-valued entries are conf-relevant.
+        (Object.fromEntries(
+          Object.entries(input).filter(([, v]) => typeof v === "string"),
+        ) as Record<string, string>);
   for (const key of REQUIRED_KEYS as readonly string[]) {
     if (!raw[key]) throw new Error(`missing required conf key: ${key}`);
   }
@@ -102,6 +128,7 @@ export function loadConf(input: string | Record<string, string>): Config {
     TUNNEL_SERVICE_PREFIX: raw.TUNNEL_SERVICE_PREFIX ?? `http://localhost:`,
     PUBLIC_DOMAIN: cf2.PUBLIC_DOMAIN,
     API_HOSTNAME: cf2.API_HOSTNAME,
+    INTENTS_PATH: raw.INTENTS_PATH ?? "/v1/intents",
     HMAC_SECRET: cf2.HMAC_SECRET,
     REPLAY_WINDOW_SEC: nums.REPLAY_WINDOW_SEC,
     ROUTE_WAIT_SEC: nums.ROUTE_WAIT_SEC,

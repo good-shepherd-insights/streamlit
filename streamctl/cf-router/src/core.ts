@@ -1,3 +1,19 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // cf-router shared core — the six PRD 5b.ii functions.
 // Framework-free: adapters (Worker KV/queue, FastAPI) translate I/O; the
 // core only composes CF calls from Config-injected endpoint URLs. Per the
@@ -60,6 +76,9 @@ export interface IntentRecord {
   intent: Intent;
   hostname?: string;
   verified?: boolean;
+  // Epoch ms when the router verified the applied resources; adapters set it
+  // on a terminal done flip. `verified` above is its boolean projection.
+  verified_at?: number;
   detail?: string;
   failed_reason?: string;
 }
@@ -69,6 +88,8 @@ export interface RouterStore {
   read(id: string): Promise<IntentRecord | undefined>;
   where(statuses: IntentStatus[]): Promise<IntentRecord[]>;
   write(row: IntentRecord): Promise<void>;
+  /** Retract support; backends without a physical delete may omit it. */
+  delete?(id: string): Promise<void>;
 }
 
 export interface ApplyResult {
