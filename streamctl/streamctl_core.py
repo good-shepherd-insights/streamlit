@@ -55,6 +55,11 @@ def load_conf() -> dict[str, str]:
         "STREAMCTL_GIT_LOCAL_SHA_CMD": "git -C {dir} rev-parse HEAD",
         "STREAMCTL_GIT_REMOTE_SHA_CMD": "git -C {dir} ls-remote origin HEAD",
         "STREAMCTL_WATCH_INTERVAL": "300",  # streamctl-watch.timer cadence
+        "STREAMCTL_ROUTER_URL": "",  # empty disables routing; cf-Worker or FastAPI backend URL
+        "STREAMCTL_ROUTER_SECRET": "",
+        "STREAMCTL_ROUTER_INTENTS_PATH": "/v1/intents",
+        "STREAMCTL_ROUTE_WAIT_SEC": "30",
+        "STREAMCTL_ROUTE_POST_TIMEOUT": "20",
         "STREAMCTL_WATCH_ON_BOOT": "2min",
         "STREAMCTL_UNITDIR": "/etc/systemd/system",
         "STREAMCTL_STATE_DIR": "/var/lib/streamctl",
@@ -366,6 +371,85 @@ def destroy(conf: dict[str, str], name: str) -> dict[str, object]:
     (ports_dir / name).unlink(missing_ok=True)
     save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
     return {"name": name, "destroyed": True}
+
+
+# ---------- cf-router intent client (both backends, conf-selected) ----------
+
+
+def _router_post(conf: dict[str, str], body: dict[str, object]) -> dict[str, object]:
+    """Publish one signed routing intent; URL + secret from conf only."""
+    import hashlib
+    import hmac
+    import json as _json
+    import urllib.request
+
+    router_url = (conf.get("STREAMCTL_ROUTER_URL") or "").rstrip("/")
+    secret = conf.get("STREAMCTL_ROUTER_SECRET") or ""
+    if not router_url or not secret:
+        raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL/SECRET unset in conf")
+    payload = dict(body)
+    issued = int(time.time() * 1000)
+    payload["issued_at"] = issued
+    bare = _json.dumps(payload, separators=(",", ":"))
+    mac = hmac.new(secret.encode(), (bare + str(issued)).encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(
+        f"{router_url}{conf['STREAMCTL_ROUTER_INTENTS_PATH']}",
+        data=_json.dumps({**payload, "mac": mac}).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=int(conf["STREAMCTL_ROUTE_POST_TIMEOUT"])) as resp:
+        return _json.loads(resp.read().decode())
+
+
+def publish_route(conf: dict[str, str], name: str, action: str = "create") -> dict[str, object]:
+    """Sign+publish a routing intent for app NAME; returns the pending envelope."""
+    app = get_app(conf, name)
+    return _router_post(
+        conf,
+        {
+            "id": f"{name}-{int(time.time())}",
+            "action": action,
+            "target": "home",
+            "app": name,
+            "hostname": re.sub(r"^https?://", "", app["public_url"]) if app["public_url"] != PUBLIC_URL_PLACEHOLDER else f"{name}.{conf['STREAMCTL_DOMAIN']}",
+            "port": int(app["port"]),
+        },
+    )
+
+
+def route_status(conf: dict[str, str], intent_id: str) -> dict[str, object]:
+    """Poll one intent's status from the conf-selected backend."""
+    import json as _json
+    import urllib.request
+
+    router_url = (conf.get("STREAMCTL_ROUTER_URL") or "").rstrip("/")
+    if not router_url:
+        raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL unset in conf")
+    with urllib.request.urlopen(
+        f"{router_url}{conf['STREAMCTL_ROUTER_INTENTS_PATH']}/{intent_id}",
+        timeout=int(conf["PROBE_TIMEOUT"]),
+    ) as resp:
+        return _json.loads(resp.read().decode())
+
+
+def await_route(conf: dict[str, str], intent_id: str) -> dict[str, object]:
+    """Poll until done/failed or ROUTE_WAIT_SEC elapses; last status wins."""
+    deadline = time.time() + int(conf["STREAMCTL_ROUTE_WAIT_SEC"])
+    last: dict[str, object] = {}
+    while time.time() < deadline:
+        last = route_status(conf, intent_id)
+        if last.get("status") not in (None, "pending"):
+            return last
+        time.sleep(int(conf["STREAMCTL_POLL_INTERVAL"]))
+    return {**last, "status": last.get("status") or "pending"}
+
+
+def route(conf: dict[str, str], name: str, action: str = "create") -> dict[str, object]:
+    """publish + await; surfaces backend status verbatim."""
+    intent = publish_route(conf, name, action)
+    result = await_route(conf, str(intent["id"]))
+    return {**result, "intent_id": intent["id"]}
 
 
 def _starter_app(name: str) -> str:

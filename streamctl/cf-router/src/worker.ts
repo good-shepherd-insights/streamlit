@@ -123,6 +123,7 @@ async function getIntent(id: string, deps: WorkerDeps): Promise<Response> {
       status: row.status,
       hostname: row.hostname,
       verified: row.verified_at !== undefined,
+      ...(row.failed_reason !== undefined ? { failed_reason: row.failed_reason } : {}),
     },
     200,
   );

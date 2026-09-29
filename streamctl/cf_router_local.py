@@ -654,6 +654,7 @@ def create_app(
             "id": row["id"],
             "status": row["status"],
             "verified": row.get("verified_at") is not None,
+            **({"failed_reason": row["failed_reason"]} if row.get("failed_reason") else {}),
         }
         if row.get("hostname"):
             envelope["hostname"] = row["hostname"]

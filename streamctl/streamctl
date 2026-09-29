@@ -30,6 +30,8 @@ streamctl install-watch            write+enable streamctl-watch timer (root; int
 streamctl list                     status table for every app
 streamctl status NAME              one app's full record
 streamctl destroy NAME             stop unit, drop gsictl rows, delete appdir
+streamctl route NAME               publish+await routing intent for NAME (backend from conf)
+streamctl route-backend            print the active routing backend URL
 streamctl install-api              write+enable streamctl-api.service (root)
 streamctl serve                    run the HTTP API in foreground
 """
@@ -84,6 +86,12 @@ def main(argv: list[str]) -> int:
             if len(rest) != 1:
                 fail("usage: streamctl status NAME")
             emit(core.get_app(conf, rest[0]))
+        elif cmd == "route":
+            if len(rest) != 1:
+                fail("usage: streamctl route NAME")
+            emit(core.route(conf, rest[0]))
+        elif cmd == "route-backend":
+            emit({"backend": conf.get("STREAMCTL_ROUTER_URL") or "(unset)"})
         elif cmd == "destroy":
             if len(rest) != 1:
                 fail("usage: streamctl destroy NAME")
