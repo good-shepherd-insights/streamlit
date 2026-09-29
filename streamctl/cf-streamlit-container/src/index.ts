@@ -17,8 +17,17 @@ export class StreamlitContainer extends Container {
   }
 }
 
+export interface Env {
+  MY_CONTAINER: DurableObjectNamespace<StreamlitContainer>;
+}
+
 export default {
-  async fetch(request: Request, env: { MY_CONTAINER: DurableObjectNamespace }, ctx: ExecutionContext): Promise<Response> {
-    return getContainer(env.MY_CONTAINER, "streamlit").fetch(request);
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
+    const stub = getContainer(env.MY_CONTAINER, "streamlit");
+    return stub.fetch(request);
   },
 };
