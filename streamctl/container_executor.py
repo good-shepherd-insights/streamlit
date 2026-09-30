@@ -297,6 +297,26 @@ def _edge_ip(client: httpx.Client, hostname: str, conf: dict[str, str]) -> str |
         return None
 
 
+def _alive(client: httpx.Client, url: str) -> bool:
+    """Positive check: any HTTP response at all = something still serving."""
+    try:
+        return client.get(url).status_code is not None
+    except httpx.HTTPError:
+        return False
+
+
+def step_dead(client: httpx.Client, conf: dict[str, str], url: str) -> bool:
+    """URL is dead: unreachable OR connection-refused, polled for DESTROY_VERIFY window (edge detach propagation)."""
+    poll = int(conf.get("DESTROY_POLL_SEC", "5"))
+    deadline = time.time() + int(conf.get("DESTROY_TIMEOUT_SEC", "60"))
+    while True:
+        if not _alive(client, url):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll)
+
+
 def step_health(
     client: httpx.Client,
     conf: dict[str, str],
@@ -480,7 +500,7 @@ def apply_container_intent(
         try:
             for label in destroy_cf_objects(http_, conf, hostname, worker_name=app):
                 record(label, True)
-            if not _dead(http_, f"https://{hostname}/"):
+            if not step_dead(http_, conf, f"https://{hostname}/"):
                 raise ExecutorError("public URL still answers after destroy")
             record("verify_dead", True)
             if str(conf.get("KEEP_WORKDIR", "false")).strip().lower() != "true":
