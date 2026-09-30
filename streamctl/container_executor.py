@@ -163,11 +163,13 @@ def step_build(workdir: Path, image: str, runner: Runner) -> None:
 
 
 def step_push(image: str, conf: dict[str, str], runner: Runner) -> None:
-    """Registry login (token via stdin, never argv) then push."""
+    """Push via wrangler (containers/me identity exchange handles registry auth)."""
     # registry.cloudflare.com auth is handled by wrangler (containers/me
     # identity exchange) - raw docker login with the API token 401s.
     wrangler = conf["WRANGLER_BIN"].split()
-    _run(wrangler + ["containers", "push", image], runner)
+    token = _password(conf)
+    env = {**os.environ, "CLOUDFLARE_API_TOKEN": token}
+    _run(wrangler + ["containers", "push", image], runner, env=env, secret=token)
 
 
 def step_render(
