@@ -37,7 +37,7 @@ EXECUTOR_DEFAULTS = {
     "CONTAINER_PORT": "8501",
     "CONTAINER_MAX_INSTANCES": "1",
     "IMAGE_TAG_SUFFIX": "latest",
-    "CF_CONTAINERS_PKG": "@cloudflare/containers@",
+    "CF_CONTAINERS_PKG": "^0.3.7",
     "KEEP_WORKDIR": "false",
     "HEALTH_POLL_SEC": "15",
     "HEALTH_TIMEOUT_SEC": "420",
