@@ -34,7 +34,7 @@ Account: 4972acce5fc1e4032d8bcc8375fb4c42
 ## Verification
 - vitest 65/65, tsc clean; pytest 14/14; commits through 8df3461e3e pushed to feat/cf-router (PR #2 open)
 ## CF Containers (Streamlit app IN Cloudflare)
-- Worker: streamlit-container (workers.dev + zone route)
+- Worker: streamlit-container (zone route only; workers.dev DISABLED)
 - Container app: streamlit-container-streamlitcontainer (ID a0301e09-9afd-4538-9b7d-3bca944ebdcc), image streamlit-container-streamlitcontainer (dockerfile-built)
 - DO namespace: MY_CONTAINER (StreamlitContainer)
 - Public: https://cf-streamlit.marylandinsights.com (zone route cf-streamlit.marylandinsights.com/* -> streamlit-container; A record aafb95fb proxied)
