@@ -314,9 +314,6 @@ def step_health(
     """
     poll = int(poll if poll is not None else conf["HEALTH_POLL_SEC"])
     timeout = int(timeout if timeout is not None else conf["HEALTH_TIMEOUT_SEC"])
-    import socket as _socket
-    import ssl as _ssl
-
     parsed = urlsplit(url)
     hostname = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
