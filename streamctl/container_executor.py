@@ -256,14 +256,27 @@ def image_of(intent: dict[str, object], conf: dict[str, str]) -> str:
             f"{intent['app']}-{sha}:{conf['IMAGE_TAG_SUFFIX']}")
 
 
+def _cf_idempotent_post(client: httpx.Client, conf: dict[str, str], url: str, body: object) -> Any:
+    """Create that tolerates 'already exists' so redeploys (updates) skip wiring cleanly."""
+    try:
+        return _cf(client, conf, url, "POST", body)
+    except ExecutorError as exc:
+        if "already exists" not in str(exc):
+            raise
+        return None
+
+
 def step_wire(client: httpx.Client, conf: dict[str, str], hostname: str, worker_name: str) -> None:
     """DNS A record (proxied dummy IP) + workers route for app.PUBLIC_DOMAIN."""
-    _cf(client, conf, conf["CF_DNS_RECORDS_URL"], "POST", {
-        "type": "A", "name": hostname, "content": conf["ROUTER_DUMMY_IP"], "proxied": True,
-    })
-    _cf(client, conf, conf["CF_WORKERS_ROUTES_URL"], "POST", {
-        "pattern": f"{hostname}/*", "script": worker_name,
-    })
+    for url, payload in (
+        (conf["CF_DNS_RECORDS_URL"], {
+            "type": "A", "name": hostname, "content": conf["ROUTER_DUMMY_IP"], "proxied": True,
+        }),
+        (conf["CF_WORKERS_ROUTES_URL"], {
+            "pattern": f"{hostname}/*", "script": worker_name,
+        }),
+    ):
+        _cf_idempotent_post(client, conf, url, payload)
 
 
 def step_health(
