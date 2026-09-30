@@ -35,3 +35,12 @@ Account: 4972acce5fc1e4032d8bcc8375fb4c42
 - vitest 65/65, tsc clean; pytest 14/14; commits through 8df3461e3e pushed to feat/cf-router (PR #2 open)
 ## CF Containers (TORN DOWN on user order)
 - Deleted 2026-09-29: route 85fa49d1, DNS aafb95fb, worker script, container app a0301e09. Verified: 0 applications remain, cf-streamlit.marylandinsights.com dead.
+
+## LIVE-FIRE: API-driven container build executor (2026-09-30)
+- Intent livefire-1790733976: signed POST {action:create, target:container, app:livefire, repo:good-shepherd-insights/livefire-test, port:8501} -> 202
+- Chain all green: fetch,build,push,render,npm,deploy,wire,health,verify
+- Public: https://livefire.marylandinsights.com -> 200 Streamlit (runs in a CF Container; LEAVE UP per user standing rule)
+- Assets: worker livefire (custom-domain only), container app, DNS+route on livefire.marylandinsights.com, image registry.cloudflare.com/4972acce5.../livefire-<hash>:v1
+- Repo: https://github.com/good-shepherd-insights/livefire-test (Dockerfile + app.py)
+- Executor: streamctl/container_executor.py (Backend B :8516, conf /tmp/routetest-real.conf)
+- Live-fire lessons baked into code+tests: wrangler containers push (raw docker login 401s); namespaced image refs; deploy-dir package.json + npm step; CF_CONTAINERS_PKG=^0.3.7; concrete tags (:latest rejected). Suite: 32 passed.
