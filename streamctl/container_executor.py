@@ -298,11 +298,12 @@ def _edge_ip(client: httpx.Client, hostname: str, conf: dict[str, str]) -> str |
 
 
 def _alive(client: httpx.Client, url: str) -> bool:
-    """Positive check: any HTTP response at all = something still serving."""
+    """Serving check: only real origin response (2xx-4xx) counts; CF edge error pages (5xx) and unreachable mean dead."""
     try:
-        return client.get(url).status_code is not None
+        code = client.get(url).status_code
     except httpx.HTTPError:
         return False
+    return 100 <= code < 520
 
 
 def step_dead(client: httpx.Client, conf: dict[str, str], url: str) -> bool:
