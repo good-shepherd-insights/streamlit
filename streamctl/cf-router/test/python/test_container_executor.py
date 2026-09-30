@@ -157,18 +157,17 @@ def test_build_and_push_exact_argv(tmp_path):
     conf = conf_at(tmp_path)
     workdir = Path(conf["WORK_ROOT"]) / TEST_APP
     workdir.mkdir(parents=True)
-    image = executor.image_of(make_container_intent(), dict(BASE_CONF))
-    executor.step_build(workdir, image, runner)
-    assert runner.argvs() == [["docker", "build", "-t", image, str(workdir)]]
+def test_push_exact_argv_wrangler_authtool():
+    """registry.cloudflare.com auth is wrangler's containers/me exchange, not docker login (raw token login 401s - verified live)."""
+    runner = FakeRunner()
+    conf = dict(BASE_CONF)
+    image = executor.image_of(make_container_intent(), conf)
     executor.step_push(image, conf, runner)
-    push_argv = runner.argvs()[-1]
-    assert push_argv[:2] == ["docker", "push"]
-    assert push_argv[-1] == image
-    # login came through with the registry host and user from conf, stdin secret
-    login = runner.argvs()[-2]
-    assert login[:3] == ["docker", "login", conf["CF_REGISTRY_HOST"]]
-    assert "--password-stdin" in login
-    assert all(conf["CF_REGISTRY_USER"] not in str(arg) or arg == conf["CF_REGISTRY_USER"] for arg in login)
+    push = runner.argvs()[-1]
+    wrangler = conf["WRANGLER_BIN"].split()
+    assert push == wrangler + ["containers", "push", image]
+    # no docker login / no secret on argv
+    assert "login" not in push
 
 
 def test_deploy_exact_argv_token_env_only(tmp_path):
@@ -374,7 +373,7 @@ def test_full_signed_container_intent_lifecycle(tmp_path, monkeypatch):
     # container pipeline ran: build + push + deploy argvs recorded
     argvs = runner.argvs()
     assert ["docker", "build", "-t", executor.image_of(intent, conf), str(Path(str(conf["WORK_ROOT"])) / str(intent["app"]))] in argvs
-    assert ["docker", "push", executor.image_of(intent, conf)] in argvs
+    assert ["wrangler-fake", "containers", "push", executor.image_of(intent, conf)] in argvs
     assert [*conf["WRANGLER_BIN"].split(), "deploy"] in argvs
 
 
