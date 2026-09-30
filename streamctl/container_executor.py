@@ -17,9 +17,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -279,6 +281,22 @@ def step_wire(client: httpx.Client, conf: dict[str, str], hostname: str, worker_
         _cf_idempotent_post(client, conf, url, payload)
 
 
+def _edge_ip(client: httpx.Client, hostname: str, conf: dict[str, str]) -> str | None:
+    """DoH A-record lookup via HEALTH_RESOLVER; None when unset/unreachable."""
+    resolver = conf.get("HEALTH_RESOLVER", "")
+    if not resolver:
+        return None
+    try:
+        r = client.get(
+            resolver, params={"name": hostname, "type": "A"},
+            headers={"accept": "application/dns-json"},
+        )
+        answers = (r.json().get("Answer") or []) if r.status_code == 200 else []
+        return next((a["data"] for a in answers if a.get("type") == 1), None)
+    except (httpx.HTTPError, KeyError, ValueError):
+        return None
+
+
 def step_health(
     client: httpx.Client,
     conf: dict[str, str],
@@ -287,24 +305,61 @@ def step_health(
     poll: int | None = None,
     timeout: int | None = None,
 ) -> None:
-    """GET url every HEALTH_POLL_SEC until 200 or HEALTH_TIMEOUT_SEC elapses."""
+    """GET url every HEALTH_POLL_SEC until 200 or HEALTH_TIMEOUT_SEC elapses.
+
+    Local DNS can lag (or NEGATIVE-cache) behind a freshly-wired DNS record;
+    HEALTH_RESOLVER (DoH JSON URL, e.g. https://cloudflare-dns.com/dns-query)
+    supplies the A record and the probe is then re-issued over a raw TLS
+    handshake to that edge IP with SNI + Host kept on the app hostname.
+    """
     poll = int(poll if poll is not None else conf["HEALTH_POLL_SEC"])
     timeout = int(timeout if timeout is not None else conf["HEALTH_TIMEOUT_SEC"])
+    import socket as _socket
+    import ssl as _ssl
+
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     deadline = time.time() + timeout
     while True:
-        try:
-            if client.get(url).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
+        if _probe(url, client):
+            return
+        edge = _edge_ip(client, hostname, conf)
+        if edge and _probe_tls(hostname, port, edge, parsed.path or "/"):
+            return
         if time.time() >= deadline:
             break
         time.sleep(poll)
     raise ExecutorError(f"health check failed after {timeout}s: {url}")
 
 
-# ---------- destroy (reverse order; every delete idempotent) ----------
+def _probe(url: str, client: httpx.Client | None = None) -> bool:
+    try:
+        if client is not None:
+            return client.get(url).status_code == 200
+        with httpx.Client(timeout=8) as hc:
+            return hc.get(url).status_code == 200
+    except httpx.HTTPError:
+        return False
 
+
+def _probe_tls(hostname: str, port: int, edge: str, path: str) -> bool:
+    """Raw TLS to edge IP, SNI+Host on the hostname; true on HTTP 200."""
+    try:
+        raw = _socket.create_connection((edge, port), timeout=8)
+        with _ssl.create_default_context().wrap_socket(raw, server_hostname=hostname) as tls:
+            req = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\nUser-Agent: streamctl-health\r\n\r\n"
+            tls.sendall(req.encode())
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 4096:
+                chunk = tls.recv(1024)
+                if not chunk:
+                    break
+                head += chunk
+        first = head.split(b"\r\n", 1)[0]
+        return first.endswith(b" 200 OK") or first.split(b" ")[1:2] == [b"200"]
+    except OSError:
+        return False
 
 def destroy_cf_objects(
     client: httpx.Client, conf: dict[str, str], hostname: str, worker_name: str
