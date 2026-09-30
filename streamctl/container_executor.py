@@ -37,6 +37,7 @@ EXECUTOR_DEFAULTS = {
     "CONTAINER_PORT": "8501",
     "CONTAINER_MAX_INSTANCES": "1",
     "IMAGE_TAG_SUFFIX": "latest",
+    "CF_CONTAINERS_PKG": "@cloudflare/containers@",
     "KEEP_WORKDIR": "false",
     "HEALTH_POLL_SEC": "15",
     "HEALTH_TIMEOUT_SEC": "420",
@@ -196,6 +197,20 @@ def step_render(
     (deploy_dir / "src" / "index.ts").write_text(
         render(templates["CONTAINER_INDEX_TEMPLATE"], values), encoding="utf-8"
     )
+    pkg = {
+        "name": worker_name,
+        "private": True,
+        "type": "module",
+        "dependencies": {"@cloudflare/containers": conf["CF_CONTAINERS_PKG"]},
+    }
+    (deploy_dir / "package.json").write_text(json.dumps(pkg), encoding="utf-8")
+
+
+def step_npm(deploy_dir: Path, conf: dict[str, str], runner: Runner) -> None:
+    """Install the deploy-dir package.json deps (containers helper package)."""
+    npm = conf.get("NPM_BIN", "npm").split()
+    _run([*npm, "install", "--no-audit", "--no-fund", "--loglevel", "error"],
+         runner, cwd=str(deploy_dir))
 
 
 def step_deploy(deploy_dir: Path, conf: dict[str, str], runner: Runner) -> str:
@@ -421,6 +436,7 @@ def apply_container_intent(
             ("build", lambda: step_build(workdir, image, runner)),
             ("push", lambda: step_push(image, conf, runner)),
             ("render", lambda: step_render(deploy_dir, conf, app, image, port)),
+            ("npm", lambda: step_npm(deploy_dir, conf, runner)),
             ("deploy", lambda: step_deploy(deploy_dir, conf, runner)),
             ("wire", lambda: step_wire(http_, conf, hostname, worker_name=app)),
             ("health", lambda: step_health(http_, conf, f"https://{hostname}/")),
