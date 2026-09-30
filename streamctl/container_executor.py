@@ -235,8 +235,10 @@ def hostname_of(conf: dict[str, str], intent: dict[str, object]) -> str:
 
 
 def image_of(intent: dict[str, object], conf: dict[str, str]) -> str:
+    """Namespaced CF-managed-registry ref: <host>/<account>/<app>-<hash>:<tag>."""
     sha = hashlib.sha256(str(intent["id"]).encode()).hexdigest()[:12]
-    return f"{conf['IMAGE_PREFIX']}{intent['app']}-{sha}:{conf['IMAGE_TAG_SUFFIX']}"
+    return (f"{conf['CF_REGISTRY_HOST']}/{conf['CF_ACCOUNT_ID']}/"
+            f"{intent['app']}-{sha}:{conf['IMAGE_TAG_SUFFIX']}")
 
 
 def step_wire(client: httpx.Client, conf: dict[str, str], hostname: str, worker_name: str) -> None:
