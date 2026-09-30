@@ -22,11 +22,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from typing import TYPE_CHECKING
+
 import httpx
 import streamctl_core as core
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from streamctl_core import StreamctlError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------- conf ----------
 
@@ -41,6 +46,7 @@ ROUTER_DEFAULTS = {
     "RECONCILE_INTERVAL_SEC": "3600",
     "STREAMCTL_ROUTER_BIND": "127.0.0.1",
     "STREAMCTL_ROUTER_PORT": "8515",
+    "TARGETS": "home",
 }
 REQUIRED_KEYS = (
     "CF_API_BASE",
@@ -86,9 +92,26 @@ def load_conf() -> dict[str, str]:
         f"{conf['CF_API_BASE']}/accounts/{acct}/cfd_tunnel/{tun}/configurations",
     )
     conf.setdefault(
-        "CF_CONTAINER_URL", f"{conf['CF_API_BASE']}/accounts/{acct}/containers/apps"
+        "CF_CONTAINER_URL", f"{conf['CF_API_BASE']}/accounts/{acct}/containers/applications"
+    )
+    conf.setdefault(
+        "CF_WORKERS_ROUTES_URL",
+        f"{conf['CF_API_BASE']}/zones/{conf['CF_ZONE_ID']}/workers/routes",
+    )
+    conf.setdefault(
+        "CF_SCRIPTS_URL",
+        f"{conf['CF_API_BASE']}/accounts/{acct}/workers/scripts",
     )
     return conf
+
+
+def allowed_targets(conf: dict[str, str]) -> list[str]:
+    """TARGETS conf key: comma-separated allowlist, default 'home'."""
+    return [
+        s.strip()
+        for s in conf.get("TARGETS", ROUTER_DEFAULTS["TARGETS"]).split(",")
+        if s.strip()
+    ]
 
 
 # ---------- auth (src/intent.ts twin) ----------
@@ -126,7 +149,7 @@ def verify_intent(
     issued_at = intent["issued_at"]
     window = int(conf["REPLAY_WINDOW_SEC"]) * 1000
     now_ms = time.time() * 1000 if now is None else now
-    if abs(now_ms - float(issued_at)) > window:
+    if abs(now_ms - float(str(issued_at))) > window:
         return "stale intent: issued_at outside REPLAY_WINDOW_SEC"
     expected = sign_intent(conf["HMAC_SECRET"], canonical_body(intent), issued_at)
     if not hmac.compare_digest(str(mac).lower().encode(), expected.encode()):
@@ -140,7 +163,11 @@ def verify_intent(
 class RouterStore:
     """RouterStore over one sqlite file; rows are the fixed KV envelope shape."""
 
-    _COLUMNS = ("id", "status", "intent", "hostname", "verified_at", "failed_reason")
+    _COLUMNS = (
+        "id", "status", "intent", "hostname", "verified_at", "failed_reason",
+        "repo", "port", "env_json", "steps_json",
+    )
+    _EXTRA_COLUMNS = ("repo", "port", "env_json", "steps_json")
 
     def __init__(self, path: str):
         self._lock = threading.Lock()
@@ -150,6 +177,11 @@ class RouterStore:
                 "CREATE TABLE IF NOT EXISTS intents (id TEXT PRIMARY KEY, status TEXT,"
                 " intent TEXT, hostname TEXT, verified_at INTEGER, failed_reason TEXT)"
             )
+            # Guarded ALTER TABLE: legacy dbs gain the container columns in place.
+            existing = {r[1] for r in self._db.execute("PRAGMA table_info(intents)")}
+            for col in self._EXTRA_COLUMNS:
+                if col not in existing:
+                    self._db.execute(f"ALTER TABLE intents ADD COLUMN {col} TEXT")
             self._db.commit()
 
     def _select(self, clause: str, values: tuple) -> list[dict[str, object]]:
@@ -177,9 +209,11 @@ class RouterStore:
 
     def write(self, row: dict[str, object]) -> None:
         intent = row["intent"]
+        cols = self._COLUMNS
+        marks = ",".join("?" * len(cols))
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO intents VALUES (?,?,?,?,?,?)",
+                f"INSERT OR REPLACE INTO intents ({','.join(cols)}) VALUES ({marks})",
                 (
                     str(row["id"]),
                     str(row["status"]),
@@ -189,6 +223,12 @@ class RouterStore:
                     row.get("hostname"),
                     row.get("verified_at"),
                     row.get("failed_reason"),
+                    row.get("repo"),
+                    row.get("port"),
+                    json.dumps(row["env"], separators=(",", ":"))
+                    if isinstance(row.get("env"), dict)
+                    else row.get("env_json"),
+                    row.get("steps_json"),
                 ),
             )
             self._db.commit()
@@ -202,9 +242,11 @@ class RouterStore:
 # ---------- intent shape (src/worker.ts parseIntent twin) ----------
 
 
-def parse_intent(body: object) -> dict[str, object] | None:
+def parse_intent(body: object, conf: dict[str, str] | None = None) -> dict[str, object] | None:
     """Shape gate; None rejects the POST with 400. The dict passes through
     verbatim: verify_intent re-canonicalizes the same field order it signs.
+    The container target shape (repo/port/env facts) is validated lazily by
+    the executor; here only the TARGETS allowlist is enforced.
     """
     if not isinstance(body, dict):
         return None
@@ -212,20 +254,23 @@ def parse_intent(body: object) -> dict[str, object] | None:
     def num(value: object) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
 
+    target = body.get("target")
     if (
         not isinstance(body.get("id"), str)
-        or body.get("action") not in ("create", "destroy")
-        or body.get("target") not in ("home", "container")
+        or body.get("action") not in {"create", "destroy"}
+        or target not in {"home", "container"}
         or not isinstance(body.get("app"), str)
         or not num(body.get("issued_at"))
-        or (
-            body["target"] == "home"
-            and not (isinstance(body.get("hostname"), str) and num(body.get("port")))
-        )
-        or (
-            body["target"] == "container"
-            and not isinstance(body.get("container_image"), str)
-        )
+    ):
+        return None
+    if conf is not None and target not in set(allowed_targets(conf)):
+        return None
+    if target == "home" and not (
+        isinstance(body.get("hostname"), str) and num(body.get("port"))
+    ):
+        return None
+    if target == "container" and body.get("action") == "create" and not isinstance(
+        body.get("repo"), str
     ):
         return None
     return body
@@ -309,24 +354,24 @@ def _current(
 ) -> list[dict[str, object]]:
     """Live read (core.ts get_desired_state's current half)."""
     if intent["target"] == "container":
+        raw = cf_json(client, conf, conf["CF_CONTAINER_URL"])
+        containers: list[dict[str, object]] = list(raw) if isinstance(raw, list) else []
         return [
             {
                 "kind": "container_instance",
                 "ref": i["name"],
                 "props": {"name": i["name"], "image": i["image"]},
             }
-            for i in (cf_json(client, conf, conf["CF_CONTAINER_URL"]) or [])
+            for i in containers
             if i["name"] == intent["app"]
         ]
     tunnel = cf_json(client, conf, conf["CF_TUNNEL_CONFIG_URL"]) or {}
-    records = (
-        cf_json(
-            client,
-            conf,
-            f"{conf['CF_DNS_RECORDS_URL']}?type=CNAME&name={intent['hostname']}",
-        )
-        or []
+    records_raw = cf_json(
+        client,
+        conf,
+        f"{conf['CF_DNS_RECORDS_URL']}?type=CNAME&name={intent['hostname']}",
     )
+    records: list[dict[str, object]] = list(records_raw) if isinstance(records_raw, list) else []
     return [
         {"kind": "tunnel_ingress", "ref": rule["hostname"], "props": dict(rule)}
         for rule in _tunnel_ingress(conf, client)
@@ -356,8 +401,9 @@ def _dns_ids(
 ) -> list[dict[str, object]]:
     """A dns row that exists carries its provider id, making the diff exact on re-read."""
     return [
-        {**d, "props": {**d["props"], "id": c["props"]["id"]}}
+        {**d, "props": {**dp, "id": cp["id"]}}
         if d["kind"] == "dns_record"
+        and isinstance(dp := d["props"], dict)
         and (
             c := next(
                 (
@@ -368,6 +414,7 @@ def _dns_ids(
                 None,
             )
         )
+        and isinstance(cp := c["props"], dict)
         else d
         for d in desired
     ]
@@ -390,7 +437,8 @@ def _put_ingress(
 ) -> None:
     """Single writable object (core.ts putTunnelIngress): replace-with-computed
     rules, merging ALL existing ingress hosts before dropping/adding. App rules
-    insert BEFORE the catchall (last rule must remain hostname-less)."""
+    insert BEFORE the catchall (last rule must remain hostname-less).
+    """
     rules: list[dict[str, object]] = [
         {"hostname": rule["hostname"], "service": rule["service"]}
         for rule in _tunnel_ingress(conf, client)
@@ -414,7 +462,7 @@ def _put_ingress(
     )
 
 
-def _retryable(action, conf: dict[str, str]) -> str | None:
+def _retryable(action: Callable[[], object], conf: dict[str, str]) -> str | None:
     """Run one mutation up to APPLY_MAX_RETRIES times; the last CF message wins."""
     reason = None
     for _ in range(int(conf["APPLY_MAX_RETRIES"])):
@@ -453,12 +501,14 @@ def apply_create(
     applied = []
     for resource in [d for d in desired if not any(_same(d, c) for c in current)]:
 
-        def attempt(resource=resource):
+        def attempt(resource=resource):  # type: ignore[no-untyped-def]
+            props = resource["props"]
+            assert isinstance(props, dict)
             if resource["kind"] == "tunnel_ingress":
-                _put_ingress(conf, client, str(intent["hostname"]), resource["props"])
+                _put_ingress(conf, client, str(intent["hostname"]), props)
             elif resource["kind"] == "dns_record":
                 cf_json(
-                    client, conf, conf["CF_DNS_RECORDS_URL"], "POST", resource["props"]
+                    client, conf, conf["CF_DNS_RECORDS_URL"], "POST", props
                 )
             else:
                 cf_json(
@@ -502,10 +552,12 @@ def apply_destroy(
             if doomed["kind"] == "tunnel_ingress":
                 _put_ingress(conf, client, str(doomed["ref"]))
             elif doomed["kind"] == "dns_record":
+                props = doomed["props"]
+                assert isinstance(props, dict)
                 cf_json(
                     client,
                     conf,
-                    f"{conf['CF_DNS_RECORDS_URL']}/{doomed['props']['id']}",
+                    f"{conf['CF_DNS_RECORDS_URL']}/{props['id']}",
                     "DELETE",
                 )
             else:
@@ -542,38 +594,27 @@ def apply_intent(
 ) -> str:
     """Apply one pending row to its terminal status (queue-consumer.ts twin);
     'skipped' when the row is gone (retracted) or already applied.
+    Container intents dispatch to the executor (lazy import so the router
+    still runs without docker); everything else uses the diff engine below.
     """
     row = store.read(str(intent["id"]))
     if row is None or row["status"] != "pending":
         return "skipped"
-    if intent["action"] == "destroy":
+    if intent["target"] == "container":
+        result = _apply_container(intent, conf, store, row)
+    elif intent["action"] == "destroy":
         result = apply_destroy(intent, _current(intent, conf, client), conf, client)
-    elif intent["target"] == "container":
-        result = apply_create(intent, [], conf, client)
-        if result["status"] == "done":
-            # Containers apply blind, then verify the instance re-reads warm.
-            warm = [
-                c
-                for c in _current(intent, conf, client)
-                if c["kind"] == "container_instance" and c["ref"] == intent["app"]
-            ]
-            result = (
-                {**result, "applied": warm, "existing": warm}
-                if warm
-                else {
-                    **result,
-                    "status": "failed",
-                    "failed_reason": "container instance never re-reads warm after create",
-                    "applied": [],
-                    "existing": [],
-                }
-            )
     else:
         result = apply_create(intent, _current(intent, conf, client), conf, client)
     store.write(
         {
             **row,
             "status": result["status"],
+            **(
+                {"steps_json": json.dumps(result["steps"], separators=(",", ":"))}
+                if result.get("steps")
+                else {}
+            ),
             **(
                 {"verified_at": round(time.time() * 1000)}
                 if result["status"] == "done"
@@ -587,6 +628,33 @@ def apply_intent(
         }
     )
     return "applied"
+
+
+def _apply_container(
+    intent: dict[str, object],
+    conf: dict[str, str],
+    store: RouterStore,
+    row: dict[str, object],
+) -> dict[str, object]:
+    """Container dispatch: pending -> building via the executor (lazy import,
+    so the router keeps serving home-target intents with no docker installed).
+    """
+    store.write({**row, "status": "building"})
+    import container_executor as executor
+
+    conf = {**executor.EXECUTOR_DEFAULTS, **conf}
+    result = executor.apply_container_intent(
+        intent,
+        conf,
+        store=store,
+        client=getattr(apply_intent, "_executor_client", None),
+        runner=getattr(apply_intent, "_executor_runner", None),
+    )
+    return {
+        "status": result["status"],
+        "steps": result.get("steps") or [],
+        **({"failed_reason": result["failed_reason"]} if result.get("failed_reason") else {}),
+    }
 
 
 # ---------- HTTP adapter (src/worker.ts twin) ----------
@@ -624,7 +692,7 @@ def create_app(
     @app.post(intents_path, status_code=202)
     async def post_intent(request: Request) -> object:
         try:
-            intent = parse_intent(json.loads(await request.body()))
+            intent = parse_intent(json.loads(await request.body()), conf)
         except json.JSONDecodeError:
             return JSONResponse(
                 {"error": "request body is not valid JSON"}, status_code=400
@@ -644,7 +712,13 @@ def create_app(
                 "id": intent["id"],
                 "status": "pending",
                 "intent": intent,
-                "hostname": intent.get("hostname"),
+                "hostname": intent.get("hostname")
+                or (f"{intent['app']}.{conf['PUBLIC_DOMAIN']}"
+                    if intent.get("target") == "container"
+                    else None),
+                "repo": intent.get("repo"),
+                "port": intent.get("port"),
+                "env": intent.get("env"),
             }
         )
         run_apply(
@@ -669,6 +743,12 @@ def create_app(
             "verified": row.get("verified_at") is not None,
             **({"failed_reason": row["failed_reason"]} if row.get("failed_reason") else {}),
         }
+        # Container rows carry the persisted step log; home rows predate it.
+        if row.get("steps_json"):
+            envelope["steps"] = json.loads(str(row["steps_json"]))
+            intent_row = row["intent"]
+            assert isinstance(intent_row, dict)
+            envelope["app"] = str(intent_row.get("app") or "")
         if row.get("hostname"):
             envelope["hostname"] = row["hostname"]
         return envelope
