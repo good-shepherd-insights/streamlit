@@ -1,0 +1,28 @@
+// Worker twin of streamctl/cf-streamlit-container/src/index.ts, rendered per
+// container app by streamctl/container_executor.py: the DO class boots the
+// container on first request and proxies every request to it.
+import { Container, getContainer } from "@cloudflare/containers";
+
+export class {{class_name}} extends Container {
+  defaultPort = {{app_port}};
+  envVars = {
+    STREAMLIT_SERVER_PORT: "{{app_port}}",
+    STREAMLIT_SERVER_ADDRESS: "0.0.0.0",
+    STREAMLIT_SERVER_HEADLESS: "true",
+  };
+}
+
+export interface Env {
+  CONTAINER: DurableObjectNamespace<{{class_name}}>;
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
+    const stub = getContainer(env.CONTAINER, "{{worker_name}}");
+    return stub.fetch(request);
+  },
+};

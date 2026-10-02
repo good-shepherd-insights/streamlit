@@ -1,0 +1,15 @@
+{
+  "name": "cf-router",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "types": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250915.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
