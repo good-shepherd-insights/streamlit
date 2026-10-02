@@ -1,0 +1,20 @@
+name = "streamlit-container"
+workers_dev = false
+main = "src/index.ts"
+compatibility_date = "2026-09-29"
+
+[[containers]]
+class_name = "StreamlitContainer"
+image = "./Dockerfile"
+max_instances = 2
+
+[[durable_objects.bindings]]
+name = "MY_CONTAINER"
+class_name = "StreamlitContainer"
+
+[exports.StreamlitContainer]
+type = "durable-object"
+storage = "sqlite"
+
+[observability]
+enabled = true

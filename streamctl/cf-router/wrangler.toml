@@ -1,0 +1,34 @@
+name = "cf-router"
+main = "src/worker.ts"
+compatibility_date = "2026-09-01"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+CF_API_BASE = "https://api.cloudflare.com/client/v4"
+CF_ZONE_ID = "2704c01e2a34292e7f258f49f748861b"
+CF_ACCOUNT_ID = "4972acce5fc1e4032d8bcc8375fb4c42"
+CF_TUNNEL_ID = "861baa10-37aa-4517-b788-3f4a5ec2e57e"
+PUBLIC_DOMAIN = "marylandinsights.com"
+API_HOSTNAME = "router.marylandinsights.com"
+REPLAY_WINDOW_SEC = "300"
+APPLY_MAX_RETRIES = "3"
+TUNNEL_SERVICE_PREFIX = "http://localhost:"
+
+[[kv_namespaces]]
+binding = "INTENTS_KV"
+id = "eb0b3b8293594e208994bef6f700fc6f"
+
+[[queues.producers]]
+binding = "QUEUE"
+queue = "cf-router-apply"
+
+[[queues.consumers]]
+queue = "cf-router-apply"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "cf-router-dlq"
+[[routes]]
+pattern = "router.marylandinsights.com/*"
+zone_name = "marylandinsights.com"

@@ -1,0 +1,23 @@
+# Rendered per container app by streamctl/container_executor.py (deploy step).
+# workers_dev = false is mandatory: these workers are reachable only through
+# the app.PUBLIC_DOMAIN DNS record + route the executor wires after deploy.
+name = "{{worker_name}}"
+workers_dev = false
+main = "src/index.ts"
+compatibility_date = "2026-09-29"
+
+[[containers]]
+class_name = "{{class_name}}"
+image = "{{container_image}}"
+max_instances = {{max_instances}}
+
+[[durable_objects.bindings]]
+name = "CONTAINER"
+class_name = "{{class_name}}"
+
+[exports.{{class_name}}]
+type = "durable-object"
+storage = "sqlite"
+
+[observability]
+enabled = true
