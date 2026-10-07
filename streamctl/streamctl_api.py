@@ -39,7 +39,7 @@ app = FastAPI(
         "| Request shape | `{name, source}` plain JSON | HMAC-signed intent w/ `repo` |\n"
         "| Auth | `Authorization: Bearer <token>` | HMAC-SHA256 `mac` in body |\n"
         "| Lifecycle | systemd boot + health-wait 60s | docker build + wrangler push + deploy |\n"
-        "| Public URL | `{name}.{STREAMCTL_DOMAIN}` if set; `-` otherwise | `{name}.{PUBLIC_DOMAIN}` always |\n\n"
+        "| Public URL | caller passes `domain` -> `https://{name}.{domain}` wired automatically; `-` if omitted | `{name}.{PUBLIC_DOMAIN}` always |\n\n"
         "## Auth\n\n"
         "Mutating routes (create/deploy/destroy) require:\n"
         "```\n"
@@ -58,14 +58,15 @@ app = FastAPI(
         "BASE = \"http://127.0.0.1:8510\"          # or the public tunnel URL\n"
         "H = {\"Authorization\": \"Bearer <TOKEN>\"}\n"
         "\n"
-        "# create (LIVE when it returns)\n"
+        "# create (LIVE + content-verified at public URL when it returns)\n"
         "app = requests.post(f\"{BASE}/apps\",\n"
         "                    json={\"name\": \"myapp\",\n"
-        "                          \"source\": \"https://github.com/org/shop-app.git\"},\n"
+        "                          \"source\": \"https://github.com/org/shop-app.git\",\n"
+        "                          \"domain\": \"marylandinsights.com\"},\n"
         "                    headers=H).json()\n"
-        "print(app)   # {name, port, dir, unit, public_url}\n"
+        "print(app)   # {name, port, dir, unit, public_url, tunnel_name, ...}\n"
         "\n"
-        "# list fleet (no auth)\n"
+        "# list unified fleet (no auth; rows tagged backend=selfhost|cloudflare)\n"
         "print(requests.get(f\"{BASE}/apps\").json())\n"
         "\n"
         "# redeploy in place after code changes\n"
@@ -82,6 +83,8 @@ app = FastAPI(
         "| 400 | `source not a directory or git url: ...` | bad source path/URL |\n"
         "| 400 | `directory exists but not registered: ... (destroy it first)` | stale dir, not in fleet |\n"
         "| 400 | `health check failed for myapp after 60s; unit disabled. Logs: unit-logs (journalctl -u <unit> -n 50)` | app crashed at boot |\n"
+        "| 400 | `domain not servable (no readable CF zone): example.com` | domain is not a zone the server's CF credentials can serve |\n"
+        "| 400 | `public URL did not serve real content within 60s: <url>; app torn down` | wired but never served a real app; DNS + ingress auto-reversed |\n"
         "| 401 | `bad or missing bearer token` | wrong/no token on a mutating call |\n"
         "| 404 | `unknown app: nope` | name not in the fleet |"
     ),
@@ -188,18 +191,20 @@ def healthz() -> dict:
 
 @app.get(
     "/apps",
-    summary="List the fleet",
+    summary="List the unified fleet",
     description=(
-        "Full fleet status: every registered app with its port, source, public URL, "
-        "systemd unit, and live health probe result.\n\n"
-        "Health is probed at request time against `http://127.0.0.1:<port>` using the "
-        "app's configured HEALTH_PATH; `ok` is true when the probe returns an OK code "
-        "(200|204 by default).\n\n"
+        "Full fleet status across BOTH backends, every row tagged with `backend`:\n"
+        "- `selfhost`: apps on the GSI homeserver (systemd units).\n"
+        "- `cloudflare`: CF Containers apps, read from the router intent store.\n\n"
+        "Selfhost rows carry a live health probe result, probed at request time against "
+        "`http://127.0.0.1:<port>` using the app's configured HEALTH_PATH; `ok` is true "
+        "when the probe returns an OK code (200|204 by default). Cloudflare rows carry "
+        "the router's terminal intent status (`done` = live, `failed: <reason>` otherwise).\n\n"
         "**This route is public** (no auth) - it exposes app names/ports/source paths "
         "only, and is reachable via the public tunnel. Do NOT add secrets-bearing "
         "fields to the status payload without enabling auth for it."
     ),
-    response_description="List of app rows (fleet registry + live health).",
+    response_description="Unified list of app rows (selfhost + cloudflare, tagged).",
 )
 def apps() -> list[dict]:
     """Unified fleet: self-host rows (core.status) + CF Containers rows from the
@@ -254,14 +259,25 @@ def _router_fleet() -> list[dict]:
 
 APPS_EXAMPLE = [
     {
-        "name": "tunneltest",
+        "name": "myapp",
         "port": "8502",
         "source": "<local-or-git-source>",
-        "public_url": "-",
+        "public_url": "https://myapp.marylandinsights.com",
         "unit": "streamlit@myapp.service",
         "health": "200",
         "ok": True,
-    }
+        "backend": "selfhost",
+    },
+    {
+        "name": "containerapp",
+        "port": "-",
+        "source": "https://github.com/org/container-app.git",
+        "public_url": "https://containerapp.marylandinsights.com",
+        "unit": "container:container",
+        "health": "done",
+        "ok": True,
+        "backend": "cloudflare",
+    },
 ]
 
 
@@ -293,11 +309,16 @@ def one(name: str) -> dict:
 
 
 CREATE_RESPONSE_EXAMPLE = {
-    "name": "tunneltest",
-    "port": "8502",
+    "name": "myapp",
+    "port": "8504",
     "dir": "<app-dir>",
     "unit": "streamlit@myapp.service",
-    "public_url": "-",
+    "public_url": "https://myapp.marylandinsights.com",
+    "zone_id": "2704c01e2a34292e7f258f49f748861b",
+    "zone_name": "marylandinsights.com",
+    "account_id": "<cf-account-id>",
+    "tunnel_id": "<cf-tunnel-id>",
+    "tunnel_name": "maryland-streamctl",
 }
 
 
@@ -343,15 +364,22 @@ CREATE_RESPONSE_EXAMPLE = {
         "import requests\n"
         "app = requests.post(\"http://127.0.0.1:8510/apps\",\n"
         "                    json={\"name\": \"myapp\",\n"
-        "                          \"source\": \"https://github.com/org/my-app.git\"},\n"
+        "                          \"source\": \"https://github.com/org/my-app.git\",\n"
+        "                          \"domain\": \"marylandinsights.com\"},\n"
         "                    headers={\"Authorization\": \"Bearer <TOKEN>\"}).json()\n"
-        "print(app)  # {name, port, dir, unit, public_url} - LIVE now\n"
-        "```"
+        "print(app)  # {name, port, dir, unit, public_url, tunnel_name, ...} - LIVE and content-verified\n"
+        "```\n\n"
+        "### 400 failure examples\n"
+        "- `{\"error\": \"domain not servable (no readable CF zone): example.com\"}` - domain\n"
+        "  is not a zone these credentials can serve.\n"
+        "- `{\"error\": \"public URL did not serve real content within 60s: <url>; app torn down\"}` -\n"
+        "  wiring was done but the URL never served a real app; DNS + ingress were\n"
+        "  automatically reversed and the unit disabled.\n"
     ),
-    response_description="The created app row (port, dir, unit, public_url).",
+    response_description="The created app row (port, dir, unit, public_url, resolved tunnel).",
     responses={
         400: {
-            "description": "Bad name / already exists / source problem / health-wait timeout",
+            "description": "Bad name / already exists / source problem / health-wait timeout / unservable domain / public content verify failed (app auto-torn-down)",
             "content": {
                 "application/json": {
                     "example": {"error": "bad name (must match [a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?): My App"},
@@ -427,7 +455,9 @@ def deploy_app(name: str, request: Request, _: None = Depends(auth_check)) -> di
         "2. Deregister from the auxiliary registry.\n"
         "3. Delete the app directory (the deployed copy incl. venv).\n"
         "4. Delete the port file.\n"
-        "5. Drop the fleet registry row.\n\n"
+        "5. If the app had a public URL (created with `domain`): delete the DNS CNAME "
+        "and the tunnel ingress route for `<name>.<domain>` - the URL goes dead.\n"
+        "6. Drop the fleet registry row.\n\n"
         "**The SOURCE directory is never touched** (local source dir or git origin survives "
         "the destroy - only the deployed copy dies). Port is freed for the next create.\n\n"
         "### curl - LOCAL\n"
