@@ -22,70 +22,185 @@ from fastapi import Depends, FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
+API_DESCRIPTION = (
+    "## streamctl API (self-host backend)\n\n"
+    "Fleet controller for **Streamlit apps running on the host machine** - one\n"
+    "systemd unit per app, exposed via Cloudflare tunnel when configured.\n\n"
+    "---\n\n"
+    "## Two backends - this is the SELF-HOST one\n\n"
+    "|  | SELF-HOST (**this API**) | CLOUDFLARE (skill `streamctl-containers`) |\n"
+    "|---|---|---|\n"
+    "| Compute | local streamlit processes | CF Workers/Containers at the edge |\n"
+    "| Endpoint | `http://127.0.0.1:8510` or tunnel URL | the CF worker router URL |\n"
+    "| Request | `{name, source}` plain JSON | HMAC-signed intent w/ `repo` |\n"
+    "| Auth | `Bearer <token>` header | HMAC-SHA256 `mac` in body |\n"
+    "| Lifecycle | systemd boot + 60s health-wait | docker build + wrangler deploy |\n"
+    "| Public URL | `{name}.{STREAMCTL_DOMAIN}` if set; `-` if not | `{name}.{PUBLIC_DOMAIN}` always |\n\n"
+    "Same *verbs*, different schemas - don't send a CF intent to this API or vice versa.\n\n"
+    "---\n\n"
+    "## Auth\n"
+    "Mutating routes (create / deploy / destroy) require:\n\n"
+    "```\n"
+    "Authorization: Bearer <STREAMCTL_API_TOKEN>\n"
+    "```\n\n"
+    "The token lives in the conf file on the host:\n"
+    "```bash\n"
+    "TOKEN=$(grep STREAMCTL_API_TOKEN <conf-path> | cut -d= -f2)\n"
+    "```\n\n"
+    "Or click **Authorize** (top right) and paste it once - Swagger then attaches it\n"
+    "to every request, surviving page reloads.\n\n"
+    "GET routes (/healthz, /apps, /apps/{name}) are open by design: app names/ports,\n"
+    "no secrets.\n\n"
+    "---\n\n"
+    "## Examples\n\n"
+    "### Create from a LOCAL directory\n"
+    "```bash\n"
+    "TOKEN=$(grep STREAMCTL_API_TOKEN <conf-path> | cut -d= -f2)\n"
+    "curl -s -X POST http://127.0.0.1:8510/apps \\\n"
+    "  -H \"Authorization: Bearer $TOKEN\" \\\n"
+    "  -H \"Content-Type: application/json\" \\\n"
+    "  -d '{\"name\":\"myapp\",\"source\":\"/home/me/src/myapp\"}'\n"
+    "```\n\n"
+    "### Create from a GIT URL\n"
+    "```bash\n"
+    "curl -s -X POST https://<tunnel-url>/apps \\\n"
+    "  -H \"Authorization: Bearer $TOKEN\" \\\n"
+    "  -H \"Content-Type: application/json\" \\\n"
+    "  -d '{\"name\":\"shopapp\",\"source\":\"https://github.com/org/shop-app.git\"}'\n"
+    "```\n"
+    "Response (200, app LIVE when returned):\n"
+    "```json\n"
+    "{\"name\":\"myapp\",\"port\":\"8502\",\"dir\":\"/.../myapp\",\"unit\":\"streamlit@myapp.service\",\"public_url\":\"-\"}\n"
+    "```\n\n"
+    "### List the fleet (no auth)\n"
+    "```bash\n"
+    "curl -s http://127.0.0.1:8510/apps\n"
+    "```\n"
+    "```json\n"
+    "[{\"name\":\"myapp\",\"port\":\"8502\",\"source\":\"...\",\"public_url\":\"-\",\"unit\":\"streamlit@myapp.service\",\"health\":\"200\",\"ok\":true}]\n"
+    "```\n\n"
+    "### Get one app\n"
+    "```bash\n"
+    "curl -s http://127.0.0.1:8510/apps/myapp\n"
+    "```\n\n"
+    "### Redeploy (refresh in place; after code edits or upstream git change)\n"
+    "```bash\n"
+    "curl -s -X POST https://<tunnel-url>/apps/myapp/deploy -H \"Authorization: Bearer $TOKEN\"\n"
+    "```\n\n"
+    "### Destroy (source code NEVER touched - only the deployed copy)\n"
+    "```bash\n"
+    "curl -s -X DELETE https://<tunnel-url>/apps/myapp -H \"Authorization: Bearer $TOKEN\"\n"
+    "# \"name\":\"myapp\",\"destroyed\":true\n"
+    "```\n\n"
+    "### Full round-trip (Python)\n"
+    "```python\n"
+    "import requests\n"
+    "BASE = \"http://127.0.0.1:8510\"   # or the tunnel URL\n"
+    "H = {\"Authorization\": \"Bearer <TOKEN>\"}\n\n"
+    "# create (LIVE on return)\n"
+    "app = requests.post(f\"{BASE}/apps\", json={\"name\": \"myapp\",\"source\": \"https://github.com/org/shop-app.git\"}, headers=H).json()\n"
+    "print(app)   # {name, port, dir, unit, public_url}\n\n"
+    "# list fleet\n"
+    "print(requests.get(f\"{BASE}/apps\").json())\n\n"
+    "# redeploy after edits\n"
+    "requests.post(f\"{BASE}/apps/myapp/deploy\", headers=H)\n\n"
+    "# destroy\n"
+    "requests.delete(f\"{BASE}/apps/myapp\", headers=H)\n"
+    "```\n\n"
+    "---\n\n"
+    "## Common errors (exact body strings)\n\n"
+    "| HTTP | Body | Meaning |\n|---|---|---|\n"
+    "| 400 | `bad name (must match [a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?): My App` | name not DNS-safe |\n"
+    "| 400 | `already exists: myapp` | app already created |\n"
+    "| 400 | `source not a directory or git url: ...` | bad source path/URL |\n"
+    "| 400 | `directory exists but not registered: ... (destroy it first)` | stale dir, not in fleet |\n"
+    "| 400 | `health check failed for myapp after <wait>s; unit disabled. Logs: journalctl -u streamlit@myapp -n 50` | app crashed at boot |\n"
+    "| 401 | `bad or missing bearer token` | wrong/no token on a mutating call |\n"
+    "| 404 | `unknown app: nope` | name not in the fleet |\n"
+    "| 422 | `Field required` | missing required body field |"
+)
+
+
+CONF = core.load_conf()
+
+# Public URL (from conf) for servers list
+PUBLIC_URL = (CONF.get("STREAMCTL_PUBLIC_URL") or "").rstrip("/")
+SERVERS = ([{"url": "http://127.0.0.1:8510", "description": "Local (host machine only)"}]
+          + ([{"url": PUBLIC_URL, "description": "Public (Cloudflare tunnel)"}] if PUBLIC_URL else []))
+
 app = FastAPI(
     title="streamctl API (self-host)",
     version="1.0",
-    description=(
-        "## streamctl API - SELF-HOST Streamlit fleet controller\n\n"
-        "This is the **self-host backend**: apps run as streamlit processes on the\n"
-        "host machine, one systemd unit per app, exposed publicly (optionally) via\n"
-        "a Cloudflare tunnel.\n\n"
-        "**NOT the Cloudflare Containers API** (that skill: `streamctl-containers`,\n"
-        "apps run on CF's edge as Workers/Containers). Same verbs, different schema:\n\n"
-        "| | SELF-HOST (this API) | CLOUDFLARE (streamctl-containers) |\n"
-        "|---|---|---|\n"
-        "| Compute | host machine (streamlit processes) | Cloudflare Containers/Workers |\n"
-        "| Endpoint | local port or the public tunnel URL | CF worker router URL |\n"
-        "| Request shape | `{name, source}` plain JSON | HMAC-signed intent w/ `repo` |\n"
-        "| Auth | `Authorization: Bearer <token>` | HMAC-SHA256 `mac` in body |\n"
-        "| Lifecycle | systemd boot + health-wait 60s | docker build + wrangler push + deploy |\n"
-        "| Public URL | `{name}.{STREAMCTL_DOMAIN}` if set; `-` otherwise | `{name}.{PUBLIC_DOMAIN}` always |\n\n"
-        "## Auth\n\n"
-        "Mutating routes (create/deploy/destroy) require:\n"
-        "```\n"
-        "Authorization: Bearer <STREAMCTL_API_TOKEN>\n"
-        "```\n"
-        "Read the token from the conf file on the host:\n"
-        "```bash\n"
-        "TOKEN=$(grep STREAMCTL_API_TOKEN <conf-path> | cut -d= -f2)\n"
-        "```\n"
-        "GET routes are open by design - app names/ports/source paths only, no secrets.\n\n"
-        "## EXAMPLES\n\n"
-        "Complete curl examples live on each endpoint (click one in the sidebar).\n"
-        "Python end-to-end:\n"
-        "```python\n"
-        "import requests\n"
-        "BASE = \"http://127.0.0.1:8510\"          # or the public tunnel URL\n"
-        "H = {\"Authorization\": \"Bearer <TOKEN>\"}\n"
-        "\n"
-        "# create (LIVE when it returns)\n"
-        "app = requests.post(f\"{BASE}/apps\",\n"
-        "                    json={\"name\": \"myapp\",\n"
-        "                          \"source\": \"https://github.com/org/shop-app.git\"},\n"
-        "                    headers=H).json()\n"
-        "print(app)   # {name, port, dir, unit, public_url}\n"
-        "\n"
-        "# list fleet (no auth)\n"
-        "print(requests.get(f\"{BASE}/apps\").json())\n"
-        "\n"
-        "# redeploy in place after code changes\n"
-        "requests.post(f\"{BASE}/apps/myapp/deploy\", headers=H)\n"
-        "\n"
-        "# destroy (source code NOT touched - only the deployed copy)\n"
-        "requests.delete(f\"{BASE}/apps/myapp\", headers=H)\n"
-        "```\n\n"
-        "## Common errors (exact body strings)\n\n"
-        "| HTTP | Body | Meaning |\n"
-        "|---|---|---|\n"
-        "| 400 | `bad name (must match [a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?): My App` | name not DNS-safe |\n"
-        "| 400 | `already exists: myapp` | app already created |\n"
-        "| 400 | `source not a directory or git url: ...` | bad source path/URL |\n"
-        "| 400 | `directory exists but not registered: ... (destroy it first)` | stale dir, not in fleet |\n"
-        "| 400 | `health check failed for myapp after 60s; unit disabled. Logs: unit-logs (journalctl -u <unit> -n 50)` | app crashed at boot |\n"
-        "| 401 | `bad or missing bearer token` | wrong/no token on a mutating call |\n"
-        "| 404 | `unknown app: nope` | name not in the fleet |"
-    ),
+    description=API_DESCRIPTION,
+    servers=SERVERS,
+    openapi_tags=[
+        {"name": "Overview",
+         "description": "Health and fleet discovery - start here. No auth required."},
+        {"name": "Lifecycle",
+         "description": "Create, deploy, destroy apps. Bearer auth required - click Authorize and paste the token, then Try-it-out carries it automatically."},
+    ],
+    # Swagger UI behavior upgrades:
+    swagger_ui_parameters={
+        "persistAuthorization": True,   # token survives page reloads
+        "displayRequestDuration": True, # show latency per call
+        "docExpansion": "none",         # collapsed by default: clean scan first
+        "filter": True,                 # search box in the top bar
+        "tryItOutEnabled": False,       # explicit Try-it-out click - no accidental fires
+    },
 )
+
+# ---- Security scheme: enables the "Authorize" button in Swagger UI ----
+def _openapi_with_security():
+    """Augment the default schema; everything route-level from decorators stays."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    schema = get_openapi(
+        title=app.title, version=app.version, description=app.description,
+        routes=app.routes, tags=app.openapi_tags)
+    scheme_name = "BearerAuth"
+    schema["components"]["securitySchemes"] = {
+        scheme_name: {
+            "type": "http", "scheme": "bearer",
+            "description": ("Paste the STREAMCTL_API_TOKEN (plain token, no Bearer prefix). "
+                            "Swagger attaches it to every request, surviving reloads."),
+        }
+    }
+    schema["security"] = [{scheme_name: []}]   # default=auth required; GET ops override with security=[]
+    schema["servers"] = SERVERS
+    # Request-body examples for POST /apps (route-level so they show in Swagger's "Example Value")
+    post_apps = schema["paths"].get("/apps", {}).get("post")
+    if post_apps:
+        post_apps["requestBody"] = {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/CreateAppBody"},
+                    "examples": {
+                        "local-dir": {
+                            "summary": "Local directory source",
+                            "value": {"name": "myapp", "source": "/home/me/src/myapp"},
+                        },
+                        "git-url": {
+                            "summary": "Git URL source",
+                            "value": {"name": "shopapp", "source": "https://github.com/org/shop-app.git"},
+                        },
+                    },
+                }
+            },
+        }
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = _openapi_with_security
+
+# Servers: localhost + public tunnel - selector in Swagger UI top bar
+def _servers():
+    base = (CONF.get("STREAMCTL_PUBLIC_URL") or "").rstrip("/")
+    servers = [{"url": "http://127.0.0.1:8510", "description": "Local (host machine only)"}]
+    if base:
+        servers.append({"url": base, "description": "Public (Cloudflare tunnel)"})
+    return servers
 
 CONF = core.load_conf()
 
@@ -142,6 +257,8 @@ def streamctl_error(request: Request, exc: core.StreamctlError) -> JSONResponse:
 
 @app.get(
     "/healthz",
+    tags=["Overview"],
+    openapi_extra={"security": []},
     summary="Liveness probe",
     description=(
         "Always returns `{\"ok\": true}`. Used by tunnel/monitoring health checks. No auth, never changes."
@@ -153,7 +270,9 @@ def healthz() -> dict:
 
 @app.get(
     "/apps",
-    summary="List the fleet",
+    tags=["Overview"],
+    summary="List the entire fleet (no auth) - START HERE",
+    openapi_extra={"security": []},
     description=(
         "Full fleet status: every registered app with its port, source, public URL, "
         "systemd unit, and live health probe result.\n\n"
@@ -165,6 +284,17 @@ def healthz() -> dict:
         "fields to the status payload without enabling auth for it."
     ),
     response_description="List of app rows (fleet registry + live health).",
+    responses={
+        200: {
+            "description": "The fleet",
+            "content": {"application/json": {"example": [
+                {"name": "myapp", "port": "8502", "source": "https://github.com/org/shop-app.git",
+                 "public_url": "-", "unit": "streamlit@myapp.service", "health": "200", "ok": True},
+                {"name": "demodash", "port": "8503", "source": "/home/me/src/demo",
+                 "public_url": "-", "unit": "streamlit@demodash.service", "health": "200", "ok": True},
+            ]}},
+        }
+    },
 )
 def apps() -> list[dict]:
     """Return core.status(CONF) - the fleet registry joined with live health probes."""
@@ -186,7 +316,9 @@ APPS_EXAMPLE = [
 
 @app.get(
     "/apps/{name}",
-    summary="Get one app",
+    tags=["Overview"],
+    summary="Get one app (no auth)",
+    openapi_extra={"security": []},
     description=(
         "One app row by name. Same fields as the /apps list elements.\n\n"
         "`public_url` reads `-` (placeholder) when `STREAMCTL_DOMAIN` is unset - it "
@@ -195,6 +327,12 @@ APPS_EXAMPLE = [
     ),
     response_description="App row or 404.",
     responses={
+        200: {
+            "description": "The app",
+            "content": {"application/json": {"example": {
+                "name": "myapp", "port": "8502", "source": "https://github.com/org/shop-app.git",
+                "public_url": "-", "unit": "streamlit@myapp.service", "health": "200", "ok": True}}},
+        },
         404: {
             "description": "Unknown app name",
             "content": {
@@ -223,7 +361,8 @@ CREATE_RESPONSE_EXAMPLE = {
 
 @app.post(
     "/apps",
-    summary="Create + boot a new app",
+    tags=["Lifecycle"],
+    summary="Create + boot a new app (Bearer auth)",
     description=(
         "Full lifecycle in one synchronous call:\n"
         "1. Validate name (DNS-safe) and uniqueness (already exists -> 400).\n"
@@ -287,7 +426,8 @@ def create_app(body: CreateAppBody, _: None = Depends(auth)) -> dict:
 
 @app.post(
     "/apps/{name}/deploy",
-    summary="Deploy (redeploy/restart) an existing app",
+    tags=["Lifecycle"],
+    summary="Deploy (redeploy/restart) an existing app (Bearer auth)",
     description=(
         "Redeploys the app's current source into its running unit - pulls the "
         "installed code forward (re-install of requirements if changed) and restarts "
@@ -319,7 +459,8 @@ def deploy_app(name: str, _: None = Depends(auth)) -> dict:
 
 @app.delete(
     "/apps/{name}",
-    summary="Destroy an app",
+    tags=["Lifecycle"],
+    summary="Destroy an app (Bearer auth)",
     description=(
         "Full teardown, verified reverse order:\n"
         "1. `systemctl disable --now streamlit@<name>.service` (stops + disables).\n"
