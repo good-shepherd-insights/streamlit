@@ -119,11 +119,14 @@ class CreateAppBody(BaseModel):
         )
     )
     source: str = Field(
+        default="",
         description=(
             "Where the app code comes from: an absolute directory containing app.py "
             "(copied) or a git URL (shallow-cloned). If the source lacks app.py a "
-            "starter placeholder app is written."
-        )
+            "starter placeholder app is written. Empty or missing -> 400 "
+            "`source not a directory or git url`."
+        ),
+        examples=["/home/me/src/myapp", "https://github.com/org/shop-app.git"],
     )
 
 

@@ -227,7 +227,7 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
             conf,
             f"git clone --depth 1 {shlex.quote(source)} {shlex.quote(str(appdir))}",
         )
-    elif Path(source).is_dir():
+    elif source and Path(source).is_dir():
         shutil.copytree(source, appdir, dirs_exist_ok=False)
     else:
         raise StreamctlError(f"source not a directory or git url: {source}")
