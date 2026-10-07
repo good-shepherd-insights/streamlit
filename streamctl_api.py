@@ -23,33 +23,67 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 app = FastAPI(
-    title="streamctl API",
+    title="streamctl API (self-host)",
     version="1.0",
     description=(
-        "GSI Streamlit fleet controller (self-host backend).\n\n"
-        "Create, deploy, and destroy Streamlit apps. Each app boots as its own\n"
-        "`streamlit@<name>.service` systemd unit on the next free port from the\n"
-        "pool 8502-8599, with its own uv venv and auto-installed requirements.txt.\n\n"
-        "**Base URLs**\n"
-        "- Local: `http://127.0.0.1:8510` (localhost only)\n"
-        "- Public: `https://streamlit.internal.goodshepherdinsights.com` "
-        "(Cloudflare tunnel, since 2026-10-07)\n\n"
-        "**Auth:** mutating routes (create/deploy/destroy) require "
-        "`Authorization: Bearer <STREAMCTL_API_TOKEN>` when the token is set in "
-        "`/etc/streamctl/streamctl.conf`. GET routes are open by design.\n\n"
-        "**App lifecycle:** create (clone/copy source, venv, pip, boot, health-wait) "
-        "-> deploy (reboot/redeploy) -> destroy (unit off, dir removed, deregistered).\n\n"
-        "**Public per-app URLs:** `https://{name}.{STREAMCTL_DOMAIN}` when "
-        "`STREAMCTL_DOMAIN` is set in conf (unset today -> rows show `public_url: \"-\"`).\n\n"
-        "**Fleet state source:** `/etc/streamctl/apps.tsv`.\n\n"
-        "Related skill: `streamctl-containers` (the Cloudflare Containers backend API).\n\n"
-        "Pitfalls (from source):\n"
-        "- `destroy` deletes the deployed copy under `/home/dev/streamlit-apps/<name>`;\n"
-        "  it never touches the SOURCE directory (a local `source` dir or the origin of "
-        "a git clone survives).\n"
-        "- `create` is synchronous and health-waits up to 60s; failures return 400 with "
-        "the journalctl hint.\n"
-        "- App `name` must be DNS-safe: `[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?`."
+        "## streamctl API - SELF-HOST Streamlit fleet controller\n\n"
+        "This is the **self-host backend**: apps run as streamlit processes on the\n"
+        "host machine, one systemd unit per app, exposed publicly (optionally) via\n"
+        "a Cloudflare tunnel.\n\n"
+        "**NOT the Cloudflare Containers API** (that skill: `streamctl-containers`,\n"
+        "apps run on CF's edge as Workers/Containers). Same verbs, different schema:\n\n"
+        "| | SELF-HOST (this API) | CLOUDFLARE (streamctl-containers) |\n"
+        "|---|---|---|\n"
+        "| Compute | host machine (streamlit processes) | Cloudflare Containers/Workers |\n"
+        "| Endpoint | local port or the public tunnel URL | CF worker router URL |\n"
+        "| Request shape | `{name, source}` plain JSON | HMAC-signed intent w/ `repo` |\n"
+        "| Auth | `Authorization: Bearer <token>` | HMAC-SHA256 `mac` in body |\n"
+        "| Lifecycle | systemd boot + health-wait 60s | docker build + wrangler push + deploy |\n"
+        "| Public URL | `{name}.{STREAMCTL_DOMAIN}` if set; `-` otherwise | `{name}.{PUBLIC_DOMAIN}` always |\n\n"
+        "## Auth\n\n"
+        "Mutating routes (create/deploy/destroy) require:\n"
+        "```\n"
+        "Authorization: Bearer <STREAMCTL_API_TOKEN>\n"
+        "```\n"
+        "Read the token from the conf file on the host:\n"
+        "```bash\n"
+        "TOKEN=$(grep STREAMCTL_API_TOKEN <conf-path> | cut -d= -f2)\n"
+        "```\n"
+        "GET routes are open by design - app names/ports/source paths only, no secrets.\n\n"
+        "## EXAMPLES\n\n"
+        "Complete curl examples live on each endpoint (click one in the sidebar).\n"
+        "Python end-to-end:\n"
+        "```python\n"
+        "import requests\n"
+        "BASE = \"http://127.0.0.1:8510\"          # or the public tunnel URL\n"
+        "H = {\"Authorization\": \"Bearer <TOKEN>\"}\n"
+        "\n"
+        "# create (LIVE when it returns)\n"
+        "app = requests.post(f\"{BASE}/apps\",\n"
+        "                    json={\"name\": \"myapp\",\n"
+        "                          \"source\": \"https://github.com/org/shop-app.git\"},\n"
+        "                    headers=H).json()\n"
+        "print(app)   # {name, port, dir, unit, public_url}\n"
+        "\n"
+        "# list fleet (no auth)\n"
+        "print(requests.get(f\"{BASE}/apps\").json())\n"
+        "\n"
+        "# redeploy in place after code changes\n"
+        "requests.post(f\"{BASE}/apps/myapp/deploy\", headers=H)\n"
+        "\n"
+        "# destroy (source code NOT touched - only the deployed copy)\n"
+        "requests.delete(f\"{BASE}/apps/myapp\", headers=H)\n"
+        "```\n\n"
+        "## Common errors (exact body strings)\n\n"
+        "| HTTP | Body | Meaning |\n"
+        "|---|---|---|\n"
+        "| 400 | `bad name (must match [a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?): My App` | name not DNS-safe |\n"
+        "| 400 | `already exists: myapp` | app already created |\n"
+        "| 400 | `source not a directory or git url: ...` | bad source path/URL |\n"
+        "| 400 | `directory exists but not registered: ... (destroy it first)` | stale dir, not in fleet |\n"
+        "| 400 | `health check failed for myapp after 60s; unit disabled. Logs: unit-logs (journalctl -u <unit> -n 50)` | app crashed at boot |\n"
+        "| 401 | `bad or missing bearer token` | wrong/no token on a mutating call |\n"
+        "| 404 | `unknown app: nope` | name not in the fleet |"
     ),
 )
 
@@ -71,7 +105,7 @@ class CreateAppBody(BaseModel):
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"name": "myapp", "source": "/tmp/appsrc-myapp"},
+                {"name": "myapp", "source": "/path/to/your/app"},
                 {"name": "myapp", "source": "https://github.com/org/my-app.git"},
             ]
         }
@@ -98,7 +132,7 @@ def streamctl_error(request: Request, exc: core.StreamctlError) -> JSONResponse:
     """Map streamctl operational errors to HTTP 400 with the raw message.
 
     Common causes: bad name, name already exists, source missing, health check
-    failed (boots the journalctl -u streamlit@<name> -n 50 hint).
+    failed (boots the unit log hint).
     """
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -107,8 +141,7 @@ def streamctl_error(request: Request, exc: core.StreamctlError) -> JSONResponse:
     "/healthz",
     summary="Liveness probe",
     description=(
-        "Always returns `{\"ok\": true}`. Used by tunnel health checks and the "
-        "gsictl watchdog. No auth, never changes."
+        "Always returns `{\"ok\": true}`. Used by tunnel/monitoring health checks. No auth, never changes."
     ),
 )
 def healthz() -> dict:
@@ -139,9 +172,9 @@ APPS_EXAMPLE = [
     {
         "name": "tunneltest",
         "port": "8502",
-        "source": "/tmp/appsrc-r780badk",
+        "source": "<local-or-git-source>",
         "public_url": "-",
-        "unit": "streamlit@tunneltest.service",
+        "unit": "streamlit@myapp.service",
         "health": "200",
         "ok": True,
     }
@@ -160,7 +193,7 @@ APPS_EXAMPLE = [
     response_description="App row or 404.",
     responses={
         404: {
-            "description": "Unknown app name (not in /etc/streamctl/apps.tsv)",
+            "description": "Unknown app name",
             "content": {
                 "application/json": {
                     "example": {"detail": "unknown app: nope"},
@@ -179,8 +212,8 @@ def one(name: str) -> dict:
 CREATE_RESPONSE_EXAMPLE = {
     "name": "tunneltest",
     "port": "8502",
-    "dir": "/home/dev/streamlit-apps/tunneltest",
-    "unit": "streamlit@tunneltest.service",
+    "dir": "<app-dir>",
+    "unit": "streamlit@myapp.service",
     "public_url": "-",
 }
 
@@ -199,18 +232,34 @@ CREATE_RESPONSE_EXAMPLE = {
         "6. Write STREAMCTL_PORT to ports/<name>, daemon-reload, "
         "`systemctl enable --now streamlit@<name>.service`.\n"
         "7. Health-wait up to STREAMCTL_HEALTH_WAIT (60s) for 200.\n"
-        "8. Register in /etc/streamctl/apps.tsv + gsictl registry.\n\n"
-        "**On step 7 failure the unit is auto-disabled** and a 400 carries the journalctl "
+        "8. Register in the fleet registry.\n\n"
+        "**On step 7 failure the unit is auto-disabled** and a 400 carries the unit log "
         "hint. No partial registration survives.\n\n"
-        "curl example:\n"
+        "### curl - LOCAL base (http://127.0.0.1:8510)\n"
         "```bash\n"
-        "TOKEN=...  # STREAMCTL_API_TOKEN from /etc/streamctl/streamctl.conf\n"
-        "curl -s -X POST https://streamlit.internal.goodshepherdinsights.com/apps \\\n"
+        "TOKEN=$(grep STREAMCTL_API_TOKEN conf-path | cut -d= -f2)\n"
+        "curl -s -X POST http://127.0.0.1:8510/apps \\\n"
+        "  -H \"Authorization: Bearer $TOKEN\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        "  -d '{\"name\":\"myapp\",\"source\":\"/home/me/src/myapp\"}'\n"
+        "```\n"
+        "### curl - PUBLIC tunnel base (self-host URL)\n"
+        "```bash\n"
+        "TOKEN=$(grep STREAMCTL_API_TOKEN conf-path | cut -d= -f2)\n"
+        "curl -s -X POST https://<selfhost-tunnel-url>/apps \\\n"
         "  -H \"Authorization: Bearer $TOKEN\" \\\n"
         "  -H \"Content-Type: application/json\" \\\n"
         "  -d '{\"name\":\"myapp\",\"source\":\"https://github.com/org/my-app.git\"}'\n"
         "```\n"
-        "Local variant: base URL http://127.0.0.1:8510, same body."
+        "### Python\n"
+        "```python\n"
+        "import requests\n"
+        "app = requests.post(\"http://127.0.0.1:8510/apps\",\n"
+        "                    json={\"name\": \"myapp\",\n"
+        "                          \"source\": \"https://github.com/org/my-app.git\"},\n"
+        "                    headers={\"Authorization\": \"Bearer <TOKEN>\"}).json()\n"
+        "print(app)  # {name, port, dir, unit, public_url} - LIVE now\n"
+        "```"
     ),
     response_description="The created app row (port, dir, unit, public_url).",
     responses={
@@ -242,10 +291,15 @@ def create_app(body: CreateAppBody, _: None = Depends(auth)) -> dict:
         "the systemd unit. Used after editing files, upstream git changes, or by the "
         "watch timer (STREAMCTL_WATCH_INTERVAL) for git-HEAD moved cases.\n\n"
         "Same unit, same port, same public URL - an in-place refresh.\n\n"
-        "curl example:\n"
+        "### curl - LOCAL\n"
         "```bash\n"
-        "TOKEN=...\n"
-        "curl -s -X POST https://streamlit.internal.goodshepherdinsights.com/apps/myapp/deploy \\\n"
+        "TOKEN=$(grep STREAMCTL_API_TOKEN conf-path | cut -d= -f2)\n"
+        "curl -s -X POST http://127.0.0.1:8510/apps/myapp/deploy \\\n"
+        "  -H \"Authorization: Bearer $TOKEN\"\n"
+        "```\n"
+        "### curl - PUBLIC\n"
+        "```bash\n"
+        "curl -s -X POST https://<selfhost-tunnel-url>/apps/myapp/deploy \\\n"
         "  -H \"Authorization: Bearer $TOKEN\"\n"
         "```"
     ),
@@ -266,18 +320,23 @@ def deploy_app(name: str, _: None = Depends(auth)) -> dict:
     description=(
         "Full teardown, verified reverse order:\n"
         "1. `systemctl disable --now streamlit@<name>.service` (stops + disables).\n"
-        "2. Remove from gsictl registry.\n"
-        "3. `rm -rf /home/dev/streamlit-apps/<name>` (the deployed copy incl. venv).\n"
+        "2. Deregister from the auxiliary registry.\n"
+        "3. Delete the app directory (the deployed copy incl. venv).\n"
         "4. Delete the port file.\n"
-        "5. Drop the row from apps.tsv.\n\n"
+        "5. Drop the fleet registry row.\n\n"
         "**The SOURCE directory is never touched** (local source dir or git origin survives "
         "the destroy - only the deployed copy dies). Port is freed for the next create.\n\n"
-        "curl example:\n"
+        "### curl - LOCAL\n"
         "```bash\n"
-        "TOKEN=...\n"
-        "curl -s -X DELETE https://streamlit.internal.goodshepherdinsights.com/apps/myapp \\\n"
+        "TOKEN=$(grep STREAMCTL_API_TOKEN conf-path | cut -d= -f2)\n"
+        "curl -s -X DELETE http://127.0.0.1:8510/apps/myapp \\\n"
         "  -H \"Authorization: Bearer $TOKEN\"\n"
         "```\n"
+        "### curl - PUBLIC\n"
+        "```bash\n"
+        "curl -s -X DELETE https://<selfhost-tunnel-url>/apps/myapp \\\n"
+        "  -H \"Authorization: Bearer $TOKEN\"\n"
+        "```"
         "Success response: `{\"name\": \"myapp\", \"destroyed\": true}`."
     ),
     response_description="Confirmation object.",
