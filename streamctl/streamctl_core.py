@@ -63,6 +63,11 @@ def load_conf() -> dict[str, str]:
         "STREAMCTL_WATCH_ON_BOOT": "2min",
         "STREAMCTL_UNITDIR": "/etc/systemd/system",
         "STREAMCTL_STATE_DIR": "/var/lib/streamctl",
+        "STREAMCTL_CF_ACCOUNT_ID": "",
+        "STREAMCTL_CF_TUNNEL_ID": "",
+        "STREAMCTL_CF_ZONE_ID": "",
+        "STREAMCTL_CF_CREDS_FILE": "/home/dev/.cloudflared/api-credentials.env",
+        "STREAMCTL_AUDIT_LOG": "",  # non-empty => per-call audit lines appended (jsonl)
     }
     path = Path(os.environ.get("STREAMCTL_CONF", DEFAULT_CONF))
     if path.is_file():
@@ -205,6 +210,141 @@ def health_wait(conf: dict[str, str], port: str) -> bool:
     return False
 
 
+
+# ---------- audit log (append-only jsonl; every API-visible action records here) ----------
+
+
+def audit(conf: dict[str, str], event: dict[str, object]) -> None:
+    """Append one JSON line to STREAMCTL_AUDIT_LOG (when set). Never raises:
+    a logging failure must never break an in-flight operation."""
+    path = conf.get("STREAMCTL_AUDIT_LOG") or ""
+    if not path:
+        return
+    try:
+        import json as _json
+
+        from datetime import datetime, timezone
+
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), **event}
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+# ---------- public-URL wiring (DNS + tunnel ingress via the CF API) ----------
+
+
+def _cf_secrets(conf: dict[str, str]) -> dict[str, str]:
+    """CF API credentials from STREAMCTL_CF_CREDS_FILE (never inline literals)."""
+    path = Path(conf.get("STREAMCTL_CF_CREDS_FILE") or "")
+    vals = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                vals[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"):
+        if not vals.get(k):
+            raise StreamctlError(f"CF creds file missing {k}: {path}")
+    for k in ("STREAMCTL_CF_ACCOUNT_ID", "STREAMCTL_CF_TUNNEL_ID", "STREAMCTL_CF_ZONE_ID"):
+        if not conf.get(k):
+            raise StreamctlError(f"conf missing {k} (required for public URL wiring)")
+    return vals
+
+
+def _cf(conf: dict[str, str], method: str, path_url: str, body: dict | None = None) -> dict:
+    """One Cloudflare API call. Raises StreamctlError on failure with the API error text."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    creds = _cf_secrets(conf)
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4{path_url}",
+        data=_json.dumps(body).encode() if body is not None else None,
+        headers={
+            "X-Auth-Email": creds["CLOUDFLARE_EMAIL"],
+            "X-Auth-Key": creds["CLOUDFLARE_API_KEY"],
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            out = _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise StreamctlError(f"CF API {method} {path_url} -> {e.code}: {e.read().decode(errors='replace')[:300]}") from e
+    except urllib.error.URLError as e:
+        raise StreamctlError(f"CF API unreachable: {e.reason}") from e
+    if not out.get("success"):
+        raise StreamctlError(f"CF API {method} {path_url} refused: {out.get('errors')}")
+    return out
+
+
+def _public_host(conf: dict[str, str], name: str) -> str:
+    return f"{name}.{conf['STREAMCTL_DOMAIN']}"
+
+
+def publish_public_url(conf: dict[str, str], name: str, port: str) -> str:
+    """Make {name}.{DOMAIN} live: DNS CNAME -> tunnel + ingress route -> local port.
+
+    Requires STREAMCTL_DOMAIN and the STREAMCTL_CF_* conf keys. Returns the
+    public URL. Raises StreamctlError with the CF error text on failure.
+    """
+    if not conf.get("STREAMCTL_DOMAIN"):
+        raise StreamctlError("public URL wiring requested but STREAMCTL_DOMAIN unset")
+    host = _public_host(conf, name)
+    tunnel = conf["STREAMCTL_CF_TUNNEL_ID"]
+    zone = conf["STREAMCTL_CF_ZONE_ID"]
+    account = conf["STREAMCTL_CF_ACCOUNT_ID"]
+
+    # 1. DNS CNAME -> this account's tunnel
+    recs = _cf(conf, "GET", f"/zones/{zone}/dns_records?name={host}").get("result") or []
+    if recs:
+        rec = recs[0]
+        if rec.get("content") != f"{tunnel}.cfargotunnel.com":
+            _cf(conf, "PUT", f"/zones/{zone}/dns_records/{rec['id']}",
+                {"type": "CNAME", "name": host, "content": f"{tunnel}.cfargotunnel.com",
+                 "proxied": True})
+    else:
+        _cf(conf, "POST", f"/zones/{zone}/dns_records",
+            {"type": "CNAME", "name": host, "content": f"{tunnel}.cfargotunnel.com",
+             "proxied": True})
+
+    # 2. tunnel ingress: hostname -> local port (before the 404 catchall)
+    cfg = _cf(conf, "GET", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations")["result"]["config"]
+    ing = cfg.get("ingress") or []
+    if not any(i.get("hostname") == host for i in ing):
+        idx = next((i for i, x in enumerate(ing) if not x.get("hostname")), len(ing))
+        ing.insert(idx, {"service": f"http://localhost:{port}", "hostname": host})
+        _cf(conf, "PUT", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations",
+            {"config": cfg})
+    return f"https://{host}"
+
+
+def unpublish_public_url(conf: dict[str, str], name: str) -> None:
+    """Reverse publish_public_url: DNS record + ingress route for {name}.{DOMAIN}."""
+    if not conf.get("STREAMCTL_DOMAIN"):
+        return
+    host = _public_host(conf, name)
+    zone = conf["STREAMCTL_CF_ZONE_ID"]
+    account = conf["STREAMCTL_CF_ACCOUNT_ID"]
+    tunnel = conf["STREAMCTL_CF_TUNNEL_ID"]
+
+    for rec in (_cf(conf, "GET", f"/zones/{zone}/dns_records?name={host}").get("result") or []):
+        _cf(conf, "DELETE", f"/zones/{zone}/dns_records/{rec['id']}")
+
+    cfg = _cf(conf, "GET", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations")["result"]["config"]
+    ing = [i for i in (cfg.get("ingress") or []) if i.get("hostname") != host]
+    cfg["ingress"] = ing
+    _cf(conf, "PUT", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations", {"config": cfg})
+
+
+
 # ---------- operations ----------
 
 
@@ -221,6 +361,7 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
             f"directory exists but not registered: {appdir} (destroy it first)"
         )
     root.mkdir(parents=True, exist_ok=True)
+    audit(conf, {"action": "create", "app": name, "result": "started", "source": source})
 
     if re.match(r"^(https?://|git@)", source or ""):
         sh(
@@ -255,10 +396,15 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
     sh(conf, f"systemctl enable --now {unit}")
     if not health_wait(conf, str(port)):
         sh(conf, f"systemctl disable --now {unit}")
+        audit(conf, {"action": "create", "app": name, "result": "failed", "error": "health-wait timeout"})
         raise StreamctlError(
             f"health check failed for {name} after {conf['STREAMCTL_HEALTH_WAIT']}s; unit disabled. "
             f"Logs: journalctl -u {unit} -n 50"
         )
+
+    if conf.get("STREAMCTL_DOMAIN"):
+        # make {name}.{DOMAIN} live as part of create itself (DNS + ingress)
+        public_url = publish_public_url(conf, name, str(port))
 
     rows.append(
         {
@@ -271,6 +417,7 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
     )
     save_apps(conf, rows)
     _gsictl_add(conf, rows[-1])
+    audit(conf, {"action": "create", "app": name, "result": "ok", "port": str(port)})
     return {
         "name": name,
         "port": port,
@@ -362,6 +509,7 @@ def _watch_note(out: dict[str, object], name: str, kind: str) -> None:
 
 
 def destroy(conf: dict[str, str], name: str) -> dict[str, object]:
+    audit(conf, {"action": "destroy", "app": name, "result": "started"})
     app = get_app(conf, name)
     appdir = Path(conf["STREAMCTL_ROOT"]) / name
     sh(conf, f"systemctl disable --now {app['unit']}")
@@ -369,7 +517,15 @@ def destroy(conf: dict[str, str], name: str) -> dict[str, object]:
     shutil.rmtree(appdir, ignore_errors=True)
     ports_dir = Path(conf["STREAMCTL_CONFDIR"]) / "ports"
     (ports_dir / name).unlink(missing_ok=True)
+    if app.get("public_url") not in (PUBLIC_URL_PLACEHOLDER, "", None) and conf.get("STREAMCTL_DOMAIN"):
+        try:
+            unpublish_public_url(conf, name)
+        except StreamctlError as e:
+            audit(conf, {"action": "destroy", "app": name, "result": "partial", "error": str(e)})
+            save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
+            raise
     save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
+    audit(conf, {"action": "destroy", "app": name, "result": "ok"})
     return {"name": name, "destroyed": True}
 
 

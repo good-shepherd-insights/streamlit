@@ -125,7 +125,8 @@ CONF = core.load_conf()
 
 # Public URL (from conf) for servers list
 PUBLIC_URL = (CONF.get("STREAMCTL_PUBLIC_URL") or "").rstrip("/")
-SERVERS = ([{"url": "http://127.0.0.1:8510", "description": "Local (host machine only)"}]
+API_PORT = str(CONF.get("STREAMCTL_API_PORT", "8510"))
+SERVERS = ([{"url": f"http://127.0.0.1:{API_PORT}", "description": "Local (host machine only)"}]
           + ([{"url": PUBLIC_URL, "description": "Public (Cloudflare tunnel)"}] if PUBLIC_URL else []))
 
 app = FastAPI(
@@ -243,6 +244,60 @@ class CreateAppBody(BaseModel):
         ),
         examples=["/home/me/src/myapp", "https://github.com/org/shop-app.git"],
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Access logging: every request gets one JSON line (audit.jsonl + stdout for
+# journald). Mutations additionally get a per-action audit line (before + after,
+# including failures) so no operation is silent.
+# ---------------------------------------------------------------------------
+import time as _time
+from datetime import datetime as _dt, timezone as _tz
+from starlette.middleware.base import BaseHTTPMiddleware
+import threading as _threading
+
+_AUDIT_LOCK = _threading.Lock()
+
+
+def _audit_write(rec: dict) -> None:
+    """Append one JSON line to STREAMCTL_AUDIT_LOG (never raises)."""
+    path = CONF.get("STREAMCTL_AUDIT_LOG") or ""
+    if not path:
+        return
+    try:
+        from pathlib import Path as _Path
+        p = _Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        line = __import__("json").dumps(rec, separators=(",", ":"))
+        with _AUDIT_LOCK:
+            with p.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        t0 = _time.time()
+        ip = request.client.host if request.client else "unknown"
+        response = await call_next(request)
+        dur_ms = int((_time.time() - t0) * 1000)
+        rec = {
+            "ts": _dt.now(_tz.utc).isoformat(),
+            "kind": "access",
+            "ip": ip,
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": dur_ms,
+        }
+        _audit_write(rec)
+        print(json.dumps(rec, separators=(",", ":")), flush=True)  # -> journald
+        return response
+
+
+app.add_middleware(AccessLogMiddleware)
 
 
 @app.exception_handler(core.StreamctlError)
