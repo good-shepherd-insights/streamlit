@@ -45,7 +45,6 @@ def load_conf() -> dict[str, str]:
         "STREAMCTL_APP_FILE": "app.py",
         "STREAMCTL_HEALTH_WAIT": "60",
         "STREAMCTL_POLL_INTERVAL": "1",
-        "STREAMCTL_DOMAIN": "",  # base domain; empty disables public-URL bookkeeping
         "GSICTL_REG": "/etc/gsictl/registry.tsv",
         "GSICTL_TUNNELS_REG": "/etc/gsictl/tunnels.tsv",
         "STREAMCTL_API_PORT": "8510",
@@ -63,10 +62,8 @@ def load_conf() -> dict[str, str]:
         "STREAMCTL_WATCH_ON_BOOT": "2min",
         "STREAMCTL_UNITDIR": "/etc/systemd/system",
         "STREAMCTL_STATE_DIR": "/var/lib/streamctl",
-        "STREAMCTL_CF_ACCOUNT_ID": "",
-        "STREAMCTL_CF_TUNNEL_ID": "",
-        "STREAMCTL_CF_ZONE_ID": "",
         "STREAMCTL_CF_CREDS_FILE": "/home/dev/.cloudflared/api-credentials.env",
+        "VERIFY_BODY_BYTES": "65536",  # max body read by verify_public_content
         "STREAMCTL_AUDIT_LOG": "",  # non-empty => per-call audit lines appended (jsonl)
     }
     path = Path(os.environ.get("STREAMCTL_CONF", DEFAULT_CONF))
@@ -186,15 +183,21 @@ def get_app(conf: dict[str, str], name: str) -> dict[str, str]:
 def _next_port(conf: dict[str, str], rows: list[dict[str, str]]) -> int:
     taken = {int(r["port"]) for r in rows if r["port"].isdigit()}
     base, top = int(conf["STREAMCTL_PORT_BASE"]), int(conf["STREAMCTL_PORT_MAX"])
+    import socket as _socket
+
     for port in range(base, top + 1):
-        if port not in taken:
-            return port
+        if port in taken:
+            continue
+        # registry-free is not enough: an unregistered listener (manual app,
+        # leftover unit) can hold the port. Require it to actually bind.
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                continue
+        return port
     raise StreamctlError(f"no free port in {base}-{top}")
-
-
-def _public_url(conf: dict[str, str], name: str) -> str:
-    domain = conf.get("STREAMCTL_DOMAIN", "")
-    return f"https://{name}.{domain}" if domain else PUBLIC_URL_PLACEHOLDER
 
 
 def health_wait(conf: dict[str, str], port: str) -> bool:
@@ -250,9 +253,6 @@ def _cf_secrets(conf: dict[str, str]) -> dict[str, str]:
     for k in ("CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY"):
         if not vals.get(k):
             raise StreamctlError(f"CF creds file missing {k}: {path}")
-    for k in ("STREAMCTL_CF_ACCOUNT_ID", "STREAMCTL_CF_TUNNEL_ID", "STREAMCTL_CF_ZONE_ID"):
-        if not conf.get(k):
-            raise StreamctlError(f"conf missing {k} (required for public URL wiring)")
     return vals
 
 
@@ -285,22 +285,109 @@ def _cf(conf: dict[str, str], method: str, path_url: str, body: dict | None = No
     return out
 
 
-def _public_host(conf: dict[str, str], name: str) -> str:
-    return f"{name}.{conf['STREAMCTL_DOMAIN']}"
+def _public_host(name: str, domain: str) -> str:
+    return f"{name}.{domain}"
 
 
-def publish_public_url(conf: dict[str, str], name: str, port: str) -> str:
-    """Make {name}.{DOMAIN} live: DNS CNAME -> tunnel + ingress route -> local port.
-
-    Requires STREAMCTL_DOMAIN and the STREAMCTL_CF_* conf keys. Returns the
-    public URL. Raises StreamctlError with the CF error text on failure.
+def _resolve_domain(conf: dict[str, str], domain: str) -> dict[str, str]:
+    """Look up a caller-supplied domain via the CF API: zone readable by these
+    creds, that zone's account, and a healthy non-deleted tunnel in the SAME
+    account. Nothing is assumed from conf; cross-account routing cannot happen.
     """
-    if not conf.get("STREAMCTL_DOMAIN"):
-        raise StreamctlError("public URL wiring requested but STREAMCTL_DOMAIN unset")
-    host = _public_host(conf, name)
-    tunnel = conf["STREAMCTL_CF_TUNNEL_ID"]
-    zone = conf["STREAMCTL_CF_ZONE_ID"]
-    account = conf["STREAMCTL_CF_ACCOUNT_ID"]
+    zones = _cf(conf, "GET", f"/zones?name={domain}").get("result") or []
+    if not zones:
+        raise StreamctlError(f"domain not servable (no readable CF zone): {domain}")
+    zone = zones[0]
+    account = zone["account"]["id"]
+    tunnels = (
+        _cf(conf, "GET", f"/accounts/{account}/cfd_tunnel?is_deleted=false").get("result") or []
+    )
+    if not tunnels:
+        raise StreamctlError(f"no tunnel in account for zone {domain}")
+    # Deterministic pick from live CF state only - never conf-hardcoded, never
+    # blind first-healthy. Anchor 1 (required for zones that already have
+    # routes): the tunnel whose ingress already serves a hostname in the
+    # CALLER'S zone - cross-account CNAMEs to a tunnel outside the zone's
+    # account are rejected by CF edge (530/1033), so the zone-local tunnel is
+    # the only correct choice when one exists. Anchor 2 (first route into a
+    # fresh zone): the tunnel serving this host's STREAMCTL_PUBLIC_URL hostname.
+    zone_suffix = "." + str(domain).lower()
+
+    def _tunnel_hosts(tunnel_id: str, acct: str) -> list[str]:
+        try:
+            cfg = _cf(conf, "GET", f"/accounts/{acct}/cfd_tunnel/{tunnel_id}/configurations")
+            return [
+                (i.get("hostname") or "").lower()
+                for i in (cfg.get("result", {}).get("config", {}).get("ingress") or [])
+            ]
+        except StreamctlError:
+            return []
+
+    accounts = [z["account"]["id"] for z in _cf(conf, "GET", "/zones?per_page=50").get("result") or []]
+    public_host = re.sub(r"^https?://", "", conf.get("STREAMCTL_PUBLIC_URL", "")).rstrip("/").lower()
+    chosen = None
+    chosen_account = None
+    # Anchor 1: the tunnel that live DNS in the caller's zone actually points at.
+    # Multiple tunnels can carry the same hostname in their ingress config; only
+    # the one the zone's CNAMEs target is the one CF edge routes to.
+    dns_targets: set[str] = set()
+    for rec in (_cf(conf, "GET", f"/zones/{zone['id']}/dns_records?per_page=100").get("result") or []):
+        content = str(rec.get("content", ""))
+        if content.endswith(".cfargotunnel.com"):
+            dns_targets.add(content.split(".")[0])
+    if dns_targets:
+        for acct in dict.fromkeys(accounts):
+            for t in (
+                _cf(conf, "GET", f"/accounts/{acct}/cfd_tunnel?is_deleted=false").get("result") or []
+            ):
+                # must be a live DNS target in this zone AND carry our own
+                # control hostname (proves it's this host's tunnel, not another
+                # team's tunnel that merely shares the zone)
+                if (
+                    t.get("status") == "healthy"
+                    and t["id"] in dns_targets
+                    and public_host
+                    and public_host in _tunnel_hosts(t["id"], acct)
+                ):
+                    chosen, chosen_account = t, acct
+                    break
+            if chosen is not None:
+                break
+    # Anchor 2: the tunnel serving the API's own public hostname
+    if chosen is None and public_host:
+        for acct in dict.fromkeys(accounts):
+            for t in (
+                _cf(conf, "GET", f"/accounts/{acct}/cfd_tunnel?is_deleted=false").get("result") or []
+            ):
+                if t.get("status") == "healthy" and public_host in _tunnel_hosts(t["id"], acct):
+                    chosen, chosen_account = t, acct
+                    break
+            if chosen is not None:
+                break
+    if chosen is None:
+        raise StreamctlError(
+            f"no healthy tunnel routes any {domain} hostname (or {public_host!r}); "
+            "wire the first route into this zone manually once, then create will follow it"
+        )
+    return {
+        "zone_id": zone["id"],
+        "zone_name": zone["name"],
+        "account_id": chosen_account,
+        "tunnel_id": chosen["id"],
+        "tunnel_name": chosen["name"],
+    }
+
+
+def publish_public_url(conf: dict[str, str], name: str, port: str, domain: str) -> dict[str, str]:
+    """Make {name}.{domain} live: DNS CNAME -> tunnel + ingress route -> local port.
+
+    The domain is caller-supplied; zone/account/tunnel are resolved from the CF
+    API for that domain on every call. Returns the public URL plus what was used.
+    Raises StreamctlError with the CF error text on failure.
+    """
+    r = _resolve_domain(conf, domain)
+    zone, account, tunnel = r["zone_id"], r["account_id"], r["tunnel_id"]
+    host = _public_host(name, domain)
 
     # 1. DNS CNAME -> this account's tunnel
     recs = _cf(conf, "GET", f"/zones/{zone}/dns_records?name={host}").get("result") or []
@@ -323,17 +410,18 @@ def publish_public_url(conf: dict[str, str], name: str, port: str) -> str:
         ing.insert(idx, {"service": f"http://localhost:{port}", "hostname": host})
         _cf(conf, "PUT", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations",
             {"config": cfg})
-    return f"https://{host}"
+    return {"public_url": f"https://{host}", **r}
 
 
-def unpublish_public_url(conf: dict[str, str], name: str) -> None:
-    """Reverse publish_public_url: DNS record + ingress route for {name}.{DOMAIN}."""
-    if not conf.get("STREAMCTL_DOMAIN"):
-        return
-    host = _public_host(conf, name)
-    zone = conf["STREAMCTL_CF_ZONE_ID"]
-    account = conf["STREAMCTL_CF_ACCOUNT_ID"]
-    tunnel = conf["STREAMCTL_CF_TUNNEL_ID"]
+def unpublish_public_url(conf: dict[str, str], name: str, domain: str) -> None:
+    """Reverse publish_public_url: DNS record + ingress route for {name}.{domain}.
+
+    Resolves zone/account/tunnel the same way publish does, so teardown always
+    hits the same objects publish created.
+    """
+    r = _resolve_domain(conf, domain)
+    zone, account, tunnel = r["zone_id"], r["account_id"], r["tunnel_id"]
+    host = _public_host(name, domain)
 
     for rec in (_cf(conf, "GET", f"/zones/{zone}/dns_records?name={host}").get("result") or []):
         _cf(conf, "DELETE", f"/zones/{zone}/dns_records/{rec['id']}")
@@ -348,7 +436,91 @@ def unpublish_public_url(conf: dict[str, str], name: str) -> None:
 # ---------- operations ----------
 
 
-def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
+def verify_public_content(conf: dict[str, str], url: str) -> bool:
+    """The bar: real rendered content at the public URL, not just an edge 200.
+
+    Fetches the body over the public internet and requires HTTP 200 with a
+    non-trivial HTML document (a Streamlit app always serves a real <html>
+    shell; an error page or an empty body is a FAIL).
+    """
+    import http.client
+    import json as _json
+    import socket
+    import ssl
+    import urllib.parse
+
+    def _doh_resolve(hostname: str) -> str | None:
+        """Resolve via Cloudflare DoH over a direct IP connection, bypassing any
+        stale negative cache on the local LAN resolver."""
+        try:
+            conn = http.client.HTTPSConnection("1.1.1.1", timeout=5)
+            conn.request("GET", f"/dns-query?name={hostname}&type=A",
+                         headers={"accept": "application/dns-json"})
+            data = _json.loads(conn.getresponse().read())
+            conn.close()
+            for ans in data.get("Answer") or []:
+                if ans.get("type") == 1:
+                    return ans["data"]
+        except OSError:
+            return None
+        return None
+
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname
+    try:
+        ip = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)[0][4][0]
+    except OSError:
+        ip = _doh_resolve(host)
+        if not ip:
+            return False
+
+    def _fetch(resolved_ip: str) -> tuple[int, str] | None:
+        """TLS with SNI=host to the resolved IP, plain HTTP/1.1 GET, one retry-free shot."""
+        try:
+            ctx = ssl.create_default_context()
+            raw = socket.create_connection((resolved_ip, 443), timeout=int(conf["PROBE_TIMEOUT"]))
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+            req = (
+                f"GET {parts.path or '/'} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "User-Agent: streamctl-verify/1.0\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            tls.sendall(req.encode())
+            chunks = []
+            total = int(conf.get("VERIFY_BODY_BYTES", "65536"))
+            got = 0
+            while got < total:
+                b = tls.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+                got += len(b)
+            tls.close()
+            data = b"".join(chunks).decode("utf-8", errors="replace")
+            head, _, body = data.partition("\r\n\r\n")
+            status = int(head.split(" ")[1]) if " " in head else 0
+            return status, body
+        except (OSError, ValueError):
+            return None
+
+    result = _fetch(ip)
+    if result is None:
+        doh_ip = _doh_resolve(host)
+        if doh_ip and doh_ip != ip:
+            result = _fetch(doh_ip)
+    if result is None:
+        return False
+    status, body = result
+    return (
+        status == 200
+        and "<html" in body.lower()
+        and len(body.strip()) > 200
+        and "streamlit" in body.lower()  # the app shell, not a CF/edge error page
+    )
+
+
+def create(conf: dict[str, str], name: str, source: str, domain: str = "") -> dict[str, object]:
     """Create+boot one Streamlit app. source = app dir with app.py, or a git URL."""
     if not valid_name(name):
         raise StreamctlError(f"bad name (must match {NAME_RE}): {name}")
@@ -388,7 +560,8 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
         sh(conf, f"{pip} streamlit", timeout=900)
 
     unit = f"streamlit@{name}.service"
-    public_url = _public_url(conf, name)
+    public_url = PUBLIC_URL_PLACEHOLDER
+    publish_info: dict[str, str] = {}
     ports_dir = Path(conf["STREAMCTL_CONFDIR"]) / "ports"
     ports_dir.mkdir(parents=True, exist_ok=True)
     (ports_dir / name).write_text(f"STREAMCTL_PORT={port}\n")
@@ -402,9 +575,31 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
             f"Logs: journalctl -u {unit} -n 50"
         )
 
-    if conf.get("STREAMCTL_DOMAIN"):
-        # make {name}.{DOMAIN} live as part of create itself (DNS + ingress)
-        public_url = publish_public_url(conf, name, str(port))
+    if domain:
+        # make {name}.{domain} live as part of create itself (DNS + ingress),
+        # then hold the response until the public URL serves real content.
+        result = publish_public_url(conf, name, str(port), domain)
+        public_url = result["public_url"]
+        publish_info = {k: v for k, v in result.items() if k != "public_url"}
+        deadline = time.time() + int(conf["STREAMCTL_HEALTH_WAIT"])
+        content_ok = verify_public_content(conf, public_url)
+        while not content_ok and time.time() < deadline:
+            time.sleep(3)
+            content_ok = verify_public_content(conf, public_url)
+        if not content_ok:
+            audit(conf, {
+                "action": "create", "app": name, "result": "failed",
+                "error": f"public URL did not serve real content: {public_url}",
+            })
+            try:
+                unpublish_public_url(conf, name, domain)
+            except StreamctlError as te:
+                publish_info["teardown_error"] = str(te)
+            sh(conf, f"systemctl disable --now {unit}")
+            raise StreamctlError(
+                f"public URL did not serve real content within "
+                f"{conf['STREAMCTL_HEALTH_WAIT']}s: {public_url}; app torn down"
+            )
 
     rows.append(
         {
@@ -417,13 +612,14 @@ def create(conf: dict[str, str], name: str, source: str) -> dict[str, object]:
     )
     save_apps(conf, rows)
     _gsictl_add(conf, rows[-1])
-    audit(conf, {"action": "create", "app": name, "result": "ok", "port": str(port)})
+    audit(conf, {"action": "create", "app": name, "result": "ok", "port": str(port), **publish_info})
     return {
         "name": name,
         "port": port,
         "dir": str(appdir),
         "unit": unit,
         "public_url": public_url,
+        **publish_info,
     }
 
 
@@ -517,13 +713,18 @@ def destroy(conf: dict[str, str], name: str) -> dict[str, object]:
     shutil.rmtree(appdir, ignore_errors=True)
     ports_dir = Path(conf["STREAMCTL_CONFDIR"]) / "ports"
     (ports_dir / name).unlink(missing_ok=True)
-    if app.get("public_url") not in (PUBLIC_URL_PLACEHOLDER, "", None) and conf.get("STREAMCTL_DOMAIN"):
-        try:
-            unpublish_public_url(conf, name)
-        except StreamctlError as e:
-            audit(conf, {"action": "destroy", "app": name, "result": "partial", "error": str(e)})
-            save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
-            raise
+    url = app.get("public_url") or ""
+    if url not in (PUBLIC_URL_PLACEHOLDER, ""):
+        # derive the caller-chosen domain from the stored public URL
+        host = re.sub(r"^https?://", "", url).rstrip("/")
+        domain = host.split(".", 1)[1] if "." in host else ""
+        if domain:
+            try:
+                unpublish_public_url(conf, name, domain)
+            except StreamctlError as e:
+                audit(conf, {"action": "destroy", "app": name, "result": "partial", "error": str(e)})
+                save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
+                raise
     save_apps(conf, [r for r in load_apps(conf) if r["name"] != name])
     audit(conf, {"action": "destroy", "app": name, "result": "ok"})
     return {"name": name, "destroyed": True}
@@ -551,7 +752,6 @@ def _router_post(conf: dict[str, str], body: dict[str, object]) -> dict[str, obj
     secret = conf.get("STREAMCTL_ROUTER_SECRET") or ""
     if not secret:
         raise StreamctlError("routing requested but STREAMCTL_ROUTER_SECRET unset in conf")
-        raise StreamctlError("routing requested but STREAMCTL_ROUTER_URL/SECRET unset in conf")
     payload = dict(body)
     issued = int(time.time() * 1000)
     payload["issued_at"] = issued
@@ -571,7 +771,7 @@ def _route_hostname(conf: dict[str, str], app: dict[str, str]) -> str:
     """The app's public hostname; re-derives from conf when the row predates a domain."""
     if app["public_url"] != PUBLIC_URL_PLACEHOLDER:
         return re.sub(r"^https?://", "", app["public_url"]).rstrip("/")
-    return re.sub(r"^https?://", "", _public_url(conf, app["name"])).rstrip("/")
+    return re.sub(r"^https?://", "", app["public_url"]).rstrip("/")
 
 
 def publish_route(conf: dict[str, str], name: str, action: str = "create") -> dict[str, object]:

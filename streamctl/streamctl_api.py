@@ -90,6 +90,19 @@ app = FastAPI(
 CONF = core.load_conf()
 
 
+def _route_audit(request: Request, action: str, app: str, result: str, **extra: object) -> None:
+    """Business-action audit line (distinct from the generic access middleware):
+    {ts, ip, action, app, result, error?}. Never raises."""
+    core.audit(CONF, {
+        "kind": "action",
+        "ip": request.client.host if request.client else "",
+        "action": action,
+        "app": app,
+        "result": result,
+        **extra,
+    })
+
+
 def auth(request: Request) -> None:
     token = CONF.get("STREAMCTL_API_TOKEN", "")
     if not token:
@@ -99,14 +112,25 @@ def auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="bad or missing bearer token")
 
 
+def auth_check(request: Request) -> None:
+    """auth() plus a route-level audit line on auth failure (per-route audit must
+    cover validation/auth failures, not only successful calls)."""
+    token = CONF.get("STREAMCTL_API_TOKEN", "")
+    if token and request.headers.get("Authorization", "") != f"Bearer {token}":
+        _route_audit(request, request.method, "-", "auth_failed")
+    auth(request)
+
+
 class CreateAppBody(BaseModel):
     """Request body for creating a new Streamlit app."""
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"name": "myapp", "source": "/path/to/your/app"},
-                {"name": "myapp", "source": "https://github.com/org/my-app.git"},
+                {"name": "myapp", "source": "/path/to/your/app",
+                 "domain": "marylandinsights.com"},
+                {"name": "myapp", "source": "https://github.com/org/my-app.git",
+                 "domain": "marylandinsights.com"},
             ]
         }
     }
@@ -127,6 +151,17 @@ class CreateAppBody(BaseModel):
             "`source not a directory or git url`."
         ),
         examples=["/home/me/src/myapp", "https://github.com/org/shop-app.git"],
+    )
+    domain: str = Field(
+        default="",
+        description=(
+            "Caller-chosen base domain for the public URL `<name>.<domain>`. The "
+            "server validates the domain is a CF zone readable by its credentials, "
+            "resolves zone/account/tunnel itself, wires DNS + tunnel ingress, and "
+            "verifies real rendered content at the public URL before responding. "
+            "Empty = private app (public_url `-`). Unservable domain -> 400."
+        ),
+        examples=["marylandinsights.com"],
     )
 
 
@@ -167,8 +202,54 @@ def healthz() -> dict:
     response_description="List of app rows (fleet registry + live health).",
 )
 def apps() -> list[dict]:
-    """Return core.status(CONF) - the fleet registry joined with live health probes."""
-    return core.status(CONF)
+    """Unified fleet: self-host rows (core.status) + CF Containers rows from the
+    router, tagged backend=selfhost|cloudflare."""
+    rows: list[dict] = []
+    for r in core.status(CONF):
+        r["backend"] = "selfhost"
+        rows.append(r)
+    for r in _router_fleet():
+        r["backend"] = "cloudflare"
+        if not any(x.get("name") == r.get("name") and x.get("backend") == "cloudflare" for x in rows):
+            rows.append(r)
+    return rows
+
+
+def _router_fleet() -> list[dict]:
+    """CF Containers fleet from the local router intent store (mirror of the KV
+    rows; the deployed Worker is the source of truth and this is its twin).
+    Failures are surfaced as one cloudflare row with health='router-error',
+    never swallowed."""
+    import json as _json
+    import sqlite3 as _sq
+
+    db = CONF.get("STREAMCTL_ROUTER_DB") or "/var/lib/streamctl/router-intents.sqlite3"
+    try:
+        con = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        rows = con.execute(
+            "SELECT id, status, intent, hostname, failed_reason, repo, port "
+            "FROM intents ORDER BY rowid DESC"
+        ).fetchall()
+        con.close()
+    except Exception as e:
+        return [{"name": "-", "port": "-", "source": "-", "public_url": "-",
+                 "unit": "-", "health": f"router-error: {e}", "ok": False}]
+    out: list[dict] = []
+    for _id, status, raw, hostname, failed_reason, repo, port in rows:
+        try:
+            intent = _json.loads(raw) if raw else {}
+        except Exception:
+            intent = {}
+        out.append({
+            "name": intent.get("app") or _id,
+            "port": port or "-",
+            "source": repo or intent.get("repo") or "-",
+            "public_url": f"https://{hostname}" if hostname else "-",
+            "unit": f"container:{intent.get('target') or 'container'}",
+            "health": status if status != "failed" else f"failed: {failed_reason or '?'}",
+            "ok": status == "done",
+        })
+    return out
 
 
 APPS_EXAMPLE = [
@@ -189,9 +270,8 @@ APPS_EXAMPLE = [
     summary="Get one app",
     description=(
         "One app row by name. Same fields as the /apps list elements.\n\n"
-        "`public_url` reads `-` (placeholder) when `STREAMCTL_DOMAIN` is unset - it "
-        "means no automatic URL bookkeeping, not necessarily that the app is private "
-        "(a manually-tunneled app can still be public)."
+        "`public_url` reads `-` when the app was created without a `domain` - it "
+        "means the app is private (no automatic URL was wired at create time)."
     ),
     response_description="App row or 404.",
     responses={
@@ -235,16 +315,20 @@ CREATE_RESPONSE_EXAMPLE = {
         "6. Write STREAMCTL_PORT to ports/<name>, daemon-reload, "
         "`systemctl enable --now streamlit@<name>.service`.\n"
         "7. Health-wait up to STREAMCTL_HEALTH_WAIT (60s) for 200.\n"
-        "8. Register in the fleet registry.\n\n"
-        "**On step 7 failure the unit is auto-disabled** and a 400 carries the unit log "
-        "hint. No partial registration survives.\n\n"
+        "8. Register in the fleet registry.\n"
+        "9. If `domain` was supplied: wire DNS + tunnel ingress for `<name>.<domain>`, "
+        "then verify real rendered content at the public URL - the call returns 200 only "
+        "after the URL serves an actual app, otherwise the app is torn down and 400 "
+        "carries the cause.\n\n"
+        "**On health or public-verify failure the unit is auto-disabled** and the 400 "
+        "carries the cause. No partial registration survives.\n\n"
         "### curl - LOCAL base (http://127.0.0.1:8510)\n"
         "```bash\n"
         "TOKEN=$(grep STREAMCTL_API_TOKEN conf-path | cut -d= -f2)\n"
         "curl -s -X POST http://127.0.0.1:8510/apps \\\n"
         "  -H \"Authorization: Bearer $TOKEN\" \\\n"
         "  -H \"Content-Type: application/json\" \\\n"
-        "  -d '{\"name\":\"myapp\",\"source\":\"/home/me/src/myapp\"}'\n"
+        "  -d '{\"name\":\"myapp\",\"source\":\"/home/me/src/myapp\",\"domain\":\"marylandinsights.com\"}'\n"
         "```\n"
         "### curl - PUBLIC tunnel base (self-host URL)\n"
         "```bash\n"
@@ -252,7 +336,7 @@ CREATE_RESPONSE_EXAMPLE = {
         "curl -s -X POST https://<selfhost-tunnel-url>/apps \\\n"
         "  -H \"Authorization: Bearer $TOKEN\" \\\n"
         "  -H \"Content-Type: application/json\" \\\n"
-        "  -d '{\"name\":\"myapp\",\"source\":\"https://github.com/org/my-app.git\"}'\n"
+        "  -d '{\"name\":\"myapp\",\"source\":\"https://github.com/org/my-app.git\",\"domain\":\"marylandinsights.com\"}'\n"
         "```\n"
         "### Python\n"
         "```python\n"
@@ -281,8 +365,15 @@ CREATE_RESPONSE_EXAMPLE = {
     },
     status_code=200,
 )
-def create_app(body: CreateAppBody, _: None = Depends(auth)) -> dict:
-    return core.create(CONF, str(body.name), str(body.source))
+def create_app(body: CreateAppBody, request: Request, _: None = Depends(auth_check)) -> dict:
+    _route_audit(request, "create", body.name, "accepted", domain=body.domain)
+    try:
+        result = core.create(CONF, str(body.name), str(body.source), domain=str(body.domain))
+    except core.StreamctlError as e:
+        _route_audit(request, "create", body.name, "rejected", error=str(e))
+        raise
+    _route_audit(request, "create", body.name, "done", public_url=result.get("public_url"))
+    return result
 
 
 @app.post(
@@ -313,8 +404,18 @@ def create_app(body: CreateAppBody, _: None = Depends(auth)) -> dict:
         401: {"description": "Bad/missing bearer token"},
     },
 )
-def deploy_app(name: str, _: None = Depends(auth)) -> dict:
-    return core.deploy(CONF, name)
+def deploy_app(name: str, request: Request, _: None = Depends(auth_check)) -> dict:
+    _route_audit(request, "deploy", name, "accepted")
+    try:
+        result = core.deploy(CONF, name)
+    except core.StreamctlError as e:
+        _route_audit(request, "deploy", name, "rejected", error=str(e))
+        raise
+    except HTTPException as e:
+        _route_audit(request, "deploy", name, "rejected", error=str(e.detail))
+        raise
+    _route_audit(request, "deploy", name, "done")
+    return result
 
 
 @app.delete(
@@ -352,8 +453,18 @@ def deploy_app(name: str, _: None = Depends(auth)) -> dict:
         401: {"description": "Bad/missing bearer token"},
     },
 )
-def destroy_app(name: str, _: None = Depends(auth)) -> dict:
-    return core.destroy(CONF, name)
+def destroy_app(name: str, request: Request, _: None = Depends(auth_check)) -> dict:
+    _route_audit(request, "destroy", name, "accepted")
+    try:
+        result = core.destroy(CONF, name)
+    except core.StreamctlError as e:
+        _route_audit(request, "destroy", name, "rejected", error=str(e))
+        raise
+    except HTTPException as e:
+        _route_audit(request, "destroy", name, "rejected", error=str(e.detail))
+        raise
+    _route_audit(request, "destroy", name, "done")
+    return result
 
 
 def main() -> None:
