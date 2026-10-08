@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import numpy as np
@@ -36,6 +36,8 @@ from streamlit.testing.v1.element_tree import (
     BlockList,
     Help,
     Html,
+    LinkButton,
+    PageLink,
     Progress,
     Space,
     UnknownElement,
@@ -388,6 +390,104 @@ def test_progress_html_and_help() -> None:
         with pytest.raises(AppTestError, match="set_value"):
             node.set_value(1)
         with pytest.raises(AppTestError, match="click"):
+            node.click()
+
+
+def test_link_button_and_page_link_are_read_only() -> None:
+    """``st.link_button`` and ``st.page_link`` are inspectable.
+
+    ``.value`` stays the label, including ``on_click="rerun"`` link buttons
+    and page links whose label is inferred from the page title. ``.click()``
+    and ``.set_value()`` raise ``AppTestError``.
+    """
+
+    def script() -> None:
+        import streamlit as st
+
+        def home() -> None:
+            st.page_link(pages["other"])
+
+        def other_body() -> None:
+            st.write("other")
+
+        pages = {
+            "home": st.Page(home, title="Home", default=True),
+            "other": st.Page(other_body, title="Other page", url_path="other"),
+        }
+        st.navigation(list(pages.values())).run()
+
+        st.link_button(
+            "Docs",
+            "https://docs.streamlit.io",
+            key="docs",
+            help="Open docs",
+            type="primary",
+        )
+        st.link_button("Home", "https://example.com")
+        st.link_button(
+            "Rerun",
+            "https://example.com/rerun",
+            key="rerun",
+            on_click="rerun",
+        )
+        st.sidebar.link_button("Side", "https://example.com/side", key="side")
+        st.page_link(
+            "https://example.com",
+            label="Example",
+            query_params={"x": "1"},
+        )
+        with st.container(key="box"):
+            st.page_link("https://streamlit.io", label="Streamlit", icon="🎈")
+
+    at = AppTest.from_function(script).run()
+    assert not at.exception
+
+    assert at.link_button.len == 4
+    assert isinstance(at.link_button[0], LinkButton)
+    assert at.main.link_button.len == 3
+    assert at.sidebar.link_button.len == 1
+    docs = at.link_button(key="docs")
+    assert docs.value == "Docs"
+    assert docs.url == "https://docs.streamlit.io"
+    assert docs.help == "Open docs"
+    assert docs.key == "docs"
+    assert at.link_button[1].value == "Home"
+    assert at.link_button[1].key is None
+    assert at.link_button[1].url == "https://example.com"
+    rerun = at.link_button(key="rerun")
+    assert rerun.value == "Rerun"
+    assert rerun.url == "https://example.com/rerun"
+    assert at.sidebar.link_button(key="side").value == "Side"
+    assert list(at.get("link_button")) == list(at.link_button)
+    assert {node.type for node in at.link_button} == {"link_button"}
+
+    assert at.page_link.len == 3
+    assert isinstance(at.page_link[0], PageLink)
+    inferred, example, nested = at.page_link
+    assert inferred.value == "Other page"
+    assert inferred.page == "other"
+    assert inferred.external is False
+    assert inferred.key is None
+    assert example.value == "Example"
+    assert example.page == "https://example.com"
+    assert example.external is True
+    assert example.query_string == "x=1"
+    assert nested.value == "Streamlit"
+    assert nested.icon == "🎈"
+    assert at.container("box").page_link[0].value == "Streamlit"
+    assert list(at.get("page_link")) == list(at.page_link)
+
+    assert repr(docs) == "LinkButton(key='docs')"
+    assert repr(example) == "PageLink()"
+
+    for node, click_hint in (
+        (docs, "Playwright"),
+        (rerun, "on_click"),
+        (example, "switch_page"),
+    ):
+        with pytest.raises(AppTestError, match="set_value"):
+            node.set_value("nope")
+        with pytest.raises(AppTestError, match=click_hint):
             node.click()
 
 
@@ -1673,27 +1773,31 @@ def test_parse_tree_unknown_proto_subtypes_become_unknown_element() -> None:
     assert nodes[1].value == "Section"
     assert nodes[2].value == "unused format"
 
+    # Slider proto has ``set_value: bool``. Without the Element.__getattr__
+    # guard that field would be returned as a non-callable.
+    with pytest.raises(
+        AppTestError, match=r"set_value\(\) is not supported for slider"
+    ):
+        nodes[3].set_value(1)
+
 
 def test_inspectable_elements_reject_unsupported_interactions() -> None:
-    """Inspectable-only nodes reject set_value/click with AppTestError.
+    """Inspectable-only nodes reject set_value and click with AppTestError.
 
-    ``st.pagination`` is inspectable (key and current page) but has no typed
-    wrapper. Its proto field ``set_value: bool`` must not leak through
-    ``Element.__getattr__`` as a callable. Typed ``Markdown`` is covered too.
+    ``st.audio_input`` is an untyped element. Typed ``Markdown`` is covered
+    too.
     """
 
     def script():
         import streamlit as st
 
-        st.pagination(5, key="pager")
+        st.audio_input("Mic", key="mic")
         st.markdown("hi")
 
     at = AppTest.from_function(script).run()
-    node = at.get("pagination")[0]
+    node = at.get("audio_input")[0]
     assert isinstance(node, UnknownElement)
-    assert node.key == "pager"
-    assert node.value == 1
-    assert node.proto.set_value is False
+    assert node.key == "mic"
 
     inspectable_guidance = (
         "AppTest can inspect this element but does not implement "
@@ -1701,21 +1805,198 @@ def test_inspectable_elements_reject_unsupported_interactions() -> None:
         "has a key, or use a Playwright e2e test."
     )
     with pytest.raises(AppTestError) as set_value_info:
-        node.set_value(2)
+        node.set_value(b"wav")
     assert str(set_value_info.value) == (
-        "set_value() is not supported for pagination (key='pager'). "
+        "set_value() is not supported for audio_input (key='mic'). "
         f"{inspectable_guidance}"
     )
     with pytest.raises(AppTestError) as click_info:
         node.click()
     assert str(click_info.value) == (
-        f"click() is not supported for pagination (key='pager'). {inspectable_guidance}"
+        f"click() is not supported for audio_input (key='mic'). {inspectable_guidance}"
     )
     with pytest.raises(AppTestError) as markdown_info:
         at.markdown[0].set_value("nope")
     assert str(markdown_info.value) == (
         f"set_value() is not supported for markdown. {inspectable_guidance}"
     )
+
+
+def test_pagination_set_value_selects_page() -> None:
+    """``st.pagination`` is a typed widget: page changes apply on ``.run()``."""
+
+    def script():
+        import streamlit as st
+
+        st.session_state.setdefault("changes", 0)
+
+        def on_change() -> None:
+            st.session_state.changes += 1
+
+        page = st.pagination(5, key="pager", on_change=on_change)
+        st.pagination(3, default=2, key="other")
+        st.sidebar.pagination(4, key="side")
+        st.text(f"page={page}")
+
+    at = AppTest.from_function(script).run()
+    assert not at.exception
+    pager = at.pagination(key="pager")
+    assert pager.value == 1
+    assert pager.key == "pager"
+    assert at.pagination(key="other").value == 2
+    assert at.sidebar.pagination(key="side").value == 1
+    assert at.session_state["pager"] == 1
+    assert at.get("pagination")[0].value == 1
+
+    at = pager.select(3).run()
+    assert at.pagination(key="pager").value == 3
+    assert at.session_state["pager"] == 3
+    assert at.session_state["changes"] == 1
+    assert at.text[0].value == "page=3"
+
+    at = at.pagination(key="pager").set_value(5).run()
+    assert at.pagination(key="pager").value == 5
+    assert at.session_state["changes"] == 2
+
+    at.pagination(key="pager").set_value(5).run()
+    assert at.session_state["changes"] == 2
+
+    with pytest.raises(
+        AppTestError,
+        match=(
+            r"click\(\) is not supported for pagination \(key='pager'\)\. "
+            r"Use set_value\(\) or one of this widget's typed interaction methods\."
+        ),
+    ):
+        at.pagination(key="pager").click()
+
+    pager = at.pagination(key="pager")
+    pager_repr = repr(pager)
+    assert pager_repr.startswith("Pagination(")
+    assert "num_pages=5" in pager_repr
+    assert "default=1" in pager_repr
+    assert pager.num_pages == 5
+    assert pager.default == 1
+
+
+@pytest.mark.parametrize("page", [6, 0, True, 2.0])
+def test_pagination_rejects_invalid_page(page: Any) -> None:
+    """Out-of-range pages, bools, and non-ints raise AppTestError."""
+
+    def script():
+        import streamlit as st
+
+        st.pagination(5, key="pager")
+
+    at = AppTest.from_function(script).run()
+    with pytest.raises(AppTestError, match=r"between 1 and 5"):
+        at.pagination(key="pager").set_value(page)
+    assert at.pagination(key="pager").value == 1
+
+
+def test_pagination_invalid_session_state_restores_default() -> None:
+    """A non-page in session state runs and lands on the declared default."""
+
+    def script():
+        import streamlit as st
+
+        page = st.pagination(5, default=2, key="pager")
+        st.text(f"page={page}")
+
+    at = AppTest.from_function(script).run()
+    assert at.pagination(key="pager").value == 2
+
+    at.session_state["pager"] = 4
+    at = at.run()
+    assert at.pagination(key="pager").value == 4
+
+    at.session_state["pager"] = "nope"
+    at = at.run()
+    assert not at.exception
+    assert at.pagination(key="pager").value == 2
+    assert at.text[0].value == "page=2"
+
+    at.session_state["pager"] = True
+    at = at.run()
+    assert not at.exception
+    assert at.pagination(key="pager").value == 2
+    assert at.session_state["pager"] == 2
+
+    at.session_state["pager"] = 10**100
+    at = at.run()
+    assert not at.exception
+    assert at.pagination(key="pager").value == 2
+
+    at.session_state["pager"] = 4
+    at = at.run()
+    del at.session_state["pager"]
+    at = at.run()
+    assert not at.exception
+    assert at.pagination(key="pager").value == 2
+    assert at.session_state["pager"] == 2
+
+
+def test_pagination_disabled_rejects_update() -> None:
+    """A disabled pagination widget cannot change pages."""
+
+    def script():
+        import streamlit as st
+
+        st.pagination(5, disabled=True, key="pager")
+
+    at = AppTest.from_function(script).run()
+    with pytest.raises(AppTestError, match="disabled"):
+        at.pagination(key="pager").set_value(2)
+    with pytest.raises(AppTestError, match="disabled"):
+        at.pagination(key="pager").select(2)
+    at = at.run()
+    assert at.pagination(key="pager").value == 1
+
+
+def test_pagination_in_form_applies_on_submit() -> None:
+    """Form pagination stays uncommitted until that form's submit button runs."""
+
+    def script():
+        import streamlit as st
+
+        with st.form("pages"):
+            page = st.pagination(5, key="pager")
+            st.form_submit_button("Go")
+        st.text(f"page={page}")
+
+    at = AppTest.from_function(script).run()
+    at.pagination(key="pager").set_value(4)
+    assert at.pagination(key="pager").value == 4
+    at = at.run()
+    assert at.pagination(key="pager").value == 1
+    assert at.text[0].value == "page=1"
+
+    at.pagination(key="pager").set_value(4)
+    at = at.form_submit_button[0].click().run()
+    assert at.pagination(key="pager").value == 4
+    assert at.text[0].value == "page=4"
+
+
+def test_pagination_form_clear_on_submit_resets_to_default() -> None:
+    """The next submit after clear_on_submit restores the declared default page."""
+
+    def script():
+        import streamlit as st
+
+        with st.form("pages", clear_on_submit=True):
+            page = st.pagination(5, default=2, key="pager")
+            st.form_submit_button("Go")
+        st.text(f"page={page}")
+
+    at = AppTest.from_function(script).run()
+    assert at.pagination(key="pager").value == 2
+    at.pagination(key="pager").set_value(4)
+    at = at.form_submit_button[0].click().run()
+    assert at.text[0].value == "page=4"
+
+    at = at.form_submit_button[0].click().run()
+    assert at.pagination(key="pager").value == 2
+    assert at.text[0].value == "page=2"
 
 
 def test_typed_widget_without_click_raises_app_test_error() -> None:
