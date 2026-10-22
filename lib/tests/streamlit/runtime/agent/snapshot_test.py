@@ -16,15 +16,18 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import json
 import re
+from typing import Any
 
 import pandas as pd
 
 import streamlit as st
 from streamlit.error_util import show_uncaught_app_exception
 from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
+from streamlit.runtime.agent.snapshot import rebase_media_urls
 from streamlit.runtime.state import SCRIPT_RUN_WITHOUT_ERRORS_KEY
 from streamlit.testing.v1.util import patch_config_options
 from tests.streamlit.runtime.agent.snapshot_test_case import (
@@ -638,3 +641,70 @@ class SnapshotBuilderTest(SnapshotCase):
         document = self._build(navigation).document
         assert document["pages"] == [{"url_path": "", "title": "Home"}]
         assert document["page"] == document["pages"][0]
+
+
+def test_rebase_media_urls_rewrites_media_props_throughout_the_tree() -> None:
+    """Media and static file URLs in url, src, and avatar get the prefix, in lists
+    and nested nodes.
+    """
+    document: dict[str, Any] = {
+        "tree": {
+            "type": "root",
+            "children": [
+                {
+                    "type": "main",
+                    "children": [
+                        {
+                            "type": "image",
+                            "props": {"url": ["/media/a.png", "/app/static/b.png"]},
+                        },
+                        {
+                            "type": "chat_message",
+                            "props": {"name": "assistant", "avatar": "/media/c.png"},
+                            "children": [
+                                {"type": "audio", "props": {"url": "/media/d.wav"}}
+                            ],
+                        },
+                        {"type": "iframe", "props": {"src": "/media/e.html"}},
+                        {"type": "video", "props": {"url": "/app/static/f.mp4"}},
+                    ],
+                }
+            ],
+        }
+    }
+
+    rebase_media_urls(document, paths=("/media", "/app/static"), prefix="../..")
+
+    image, chat_message, iframe, video = document["tree"]["children"][0]["children"]
+    assert image["props"]["url"] == ["../../media/a.png", "../../app/static/b.png"]
+    assert chat_message["props"]["avatar"] == "../../media/c.png"
+    assert chat_message["children"][0]["props"]["url"] == "../../media/d.wav"
+    assert iframe["props"]["src"] == "../../media/e.html"
+    assert video["props"]["url"] == "../../app/static/f.mp4"
+
+
+def test_rebase_media_urls_leaves_other_values_untouched() -> None:
+    """External links, look-alike paths, emoji avatars, and other props stay as is."""
+    document: dict[str, Any] = {
+        "tree": {
+            "type": "root",
+            "children": [
+                {
+                    "type": "link_button",
+                    "props": {"label": "Docs", "url": "https://example.com/media/x"},
+                },
+                {
+                    "type": "image",
+                    "props": {"url": "/mediafiles/x.png", "caption": "/media/y.png"},
+                },
+                {"type": "audio", "props": {"url": "/app/staticfiles/x.wav"}},
+                {"type": "chat_message", "props": {"name": "user", "avatar": "🧑"}},
+                {"type": "markdown", "props": {"body": "![](/media/z.png)"}},
+            ],
+        }
+    }
+    expected = copy.deepcopy(document)
+
+    rebase_media_urls(document, paths=("/media", "/app/static"), prefix="../..")
+
+    assert document == expected

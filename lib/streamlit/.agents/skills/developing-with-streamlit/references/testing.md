@@ -203,6 +203,19 @@ assert at.query_params["status"] == "open"
 assert at.query_params["tag"] == ["a", "b"]
 ```
 
+Seed `st.user` with `at.user`, which defaults to `{"email": "test@example.com"}`. Set `is_logged_in` to `True` or `False` and add the claims the app reads; `st.user.is_logged_in` raises if the key is missing. `st.logout()` updates `at.user` for the rest of that run, including `st.rerun()`, and for later runs:
+
+- With `is_logged_in` set, `at.user` becomes `{"is_logged_in": False}`.
+- Without it, `at.user` becomes `{}`.
+
+Seed the browser fields of `st.context` with `at.context`: `timezone`, `timezone_offset`, `locale`, `url`, `is_embedded`, and `theme` (`"light"` or `"dark"`). Unset fields read as `None`. AppTest does not derive `timezone_offset` from `timezone`; set both when the app reads both. Other keys, such as `headers`, raise `AppTestError`.
+
+```python
+at.user = {"is_logged_in": True, "name": "Ada", "email": "ada@example.com"}
+at.context = {"timezone": "Europe/Berlin", "locale": "de-DE"}
+at.run()
+```
+
 ## Using pytest
 
 `AppTest` tests are plain functions — no fixtures or plugins required. `from_function` is convenient for testing a snippet inline without a separate file:
@@ -226,6 +239,40 @@ def test_counter_increments():
     assert at.metric[0].value == "1"
     assert not at.exception
 ```
+
+### Mocking app code
+
+To mock app code, patch a helper module that the script imports, not the script itself. `AppTest` runs the script from its source on every run; it does not import it. `unittest.mock.patch("app.fetch_data")` imports `app.py` as a regular module. That import runs the script's top-level code outside `AppTest`, and `.run()` never uses the patched module. If that code opens an `st.dialog`, the import raises `StreamlitAPIException`. Keep every `.run()` that should see the mock inside the `with` block:
+
+```python
+# data_source.py
+def fetch_data():
+    return "real"
+
+
+# app.py
+import streamlit as st
+
+import data_source
+
+st.write(data_source.fetch_data())
+
+
+# test_app.py
+from unittest.mock import patch
+
+from streamlit.testing.v1 import AppTest
+
+
+def test_with_mocked_data():
+    with patch("data_source.fetch_data", return_value="mocked"):
+        at = AppTest.from_file("app.py").run()
+    assert at.markdown[0].value == "mocked"
+```
+
+`patch` imports `data_source` when the `with` block starts, before `.run()` adds the script's directory to `sys.path`. The app's directory must already be on the test's `sys.path` (for example, through pytest's `pythonpath` option when tests live in another directory).
+
+Test `@st.fragment` and `@st.dialog` functions through `AppTest`. Called directly from test code, outside a running script, a fragment returns `None` without running its body, and a dialog raises `StreamlitAPIException`.
 
 ## Worked example: a filtered dataframe
 

@@ -665,10 +665,9 @@ export default defineConfig([
     },
   },
   // Flags redundant optional chains and always-true checks.
-  // Tests stay off until production source is clean. Elements and non-widget
-  // packages stay off until those directories are cleaned.
+  // Tests and packages other than lib stay off until they are cleaned up.
   {
-    files: ["lib/src/components/widgets/**/*.{ts,tsx}"],
+    files: ["lib/src/**/*.{ts,tsx}"],
     ignores: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "@typescript-eslint/no-unnecessary-condition": "error",
