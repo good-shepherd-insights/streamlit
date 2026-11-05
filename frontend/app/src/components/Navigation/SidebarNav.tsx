@@ -92,6 +92,7 @@ function NavLink({
         widgetsDisabled={widgetsDisabled}
         isExternal={isExternalPage(page)}
         externalUrl={getExternalPageUrl(page)}
+        help={page.help}
       >
         {pageName}
       </SidebarNavLink>
@@ -196,7 +197,7 @@ const SidebarNav = ({
     // Only count pages in expanded sections
     Object.entries(navigationStructure.sections).forEach(
       ([sectionName, pages]) => {
-        if (expandedSections?.[sectionName]) {
+        if (expandedSections?.[sectionName] === true) {
           count += pages.length
         }
       }

@@ -472,6 +472,7 @@ right now. Naming follows the public API, for the reason above:
               "label_visibility": "visible",
               "accept_new_options": false,
               "filter_mode": "fuzzy",
+              "required": false,
               "on_change": "rerun"
             },
             "value_schema": { "type": "string" },
@@ -602,7 +603,8 @@ Rules:
   and is auto-derived from the filename when the author does not set it (`""` for the
   default page). The internal page script hash stays internal. A single-page app has one
   page, its script, titled after the file name, so `page` and `pages` are always
-  present.
+  present. A page hidden from the navigation menu (`visibility="hidden"`) is listed
+  with `"hidden": true`, since its URL and `st.switch_page` still open it.
 - **There is no app title.** `st.set_page_config(page_title=...)` titles the browser
   tab: the app's name in an app that sets it once, the page's in one that sets it per
   page, and an app that sets none shows `page.title` there. A client could not tell
@@ -923,7 +925,8 @@ landed is a potential follow-up.
   firing it closes the dialog deliberately. With the default `on_dismiss="ignore"` the
   overlay carries no key, and closing is any full rerun, such as an interaction with no
   changes. The dialog reports `on_dismiss` as `"ignore"` or `"rerun"`, so a client can
-  tell which applies.
+  tell which applies. A `dismissible=False` dialog shows a browser user no way to close
+  it, so its overlay key has no `action` and firing it is `unsupported_element`.
 - **A scoped rerun still returns the whole page, with nothing marked stale.** The rest of
   the tree is as the last run left it, which is where a browser is too: keeping fragments
   coherent is the app's job, and `st.rerun("<key>")` is how one fragment refreshes
@@ -958,10 +961,10 @@ without introducing a new authorization surface.
 
 | Output                         | v1 representation                                                                                                                                                                                                                                          |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Dataframe, table, data editor  | `column_config` in `props`; `data` carries `columns` with their Arrow types, `row_count` and `column_count` when known, `complete`, a bounded typed `preview`, and a `url` serving the full Arrow bytes. Preview rows are values in `columns` order rather than objects, since repeating the column names per row is most of a long preview's size. Values are the data as stored, not as displayed, and an unnamed pandas index stays a column even under `hide_index`, as a column `column_config` hides does. |
-| Lazy dataframe                 | The same shape, with the chunk already emitted as the preview, `complete: false`, and `unavailable: "lazy_loading"` in place of a `url`: serving the chunk would pass part of the table off as all of it. Fetching row ranges is a follow-up.                |
-| Chart                          | Public properties in `props`, the native specification inline and whole, with Plotly's theme template dropped and its base64 typed arrays expanded into numbers, and chart data under `data` exactly as a dataframe's. A Vega-Lite chart's data travels as Arrow beside its specification, so it appears once, under `data`. |
-| Map                            | `st.map`'s plotted table under `data`, exactly as a dataframe's, without the Deck.gl specification generated from it. `st.pydeck_chart` reports its specification like any chart.                                                                          |
+| Dataframe, table, data editor  | `column_config` in `props`; `data` carries `columns` with their Arrow types, `row_count` and `column_count` when known, `complete`, a bounded typed `preview`, and a `url` serving the full Arrow bytes. Preview rows are values in `columns` order rather than objects, since repeating the column names per row is most of a long preview's size. Values are the data as stored, not as displayed, and an unnamed pandas index stays a column even under `hide_index`, as a column `column_config` hides does. A Styler's caption, which `st.table` shows below the table, is its `caption` prop. |
+| Lazy dataframe                 | The same shape, with the first `server.agentPreviewRows` rows of the chunk already emitted as the preview, `complete: false`, and `unavailable: "lazy_loading"` in place of a `url`: serving the chunk would pass part of the table off as all of it. Fetching row ranges is a follow-up. |
+| Chart                          | Public properties in `props`, the native specification inline and whole, with Plotly's theme template dropped and its base64 typed arrays expanded into numbers, and chart data under `data` exactly as a dataframe's. A Vega-Lite chart's data travels as Arrow beside its specification, so it appears once, under `data`. A built-in chart serves the table its browser plots: several `y` columns are melted to long form under ` -- streamlit-generated` `value` and `color` columns, and an unnamed index plotted as x is `index -- streamlit-generated`. |
+| Map                            | The Deck.gl specification the browser renders, under `data` as `spec`, for `st.map` and `st.pydeck_chart` alike, with a `pdk.Deck` tooltip under `tooltip`. Serving `st.map`'s plotted columns as Arrow, like a dataframe's, is follow-up #9.                                                       |
 | Image, audio, video            | Caption, `alt`, the `format` audio and video take, and the media URL the app already exposed to its own client. `st.image` reports them as the author passed the images: single values for one image, parallel lists for several. An `st.pyplot` figure is an image by the time it is emitted and is reported the same way. |
 | HTML, iframe, custom component | What the element was given: the `st.html` body, an iframe's `src` (a URL, or inline HTML), the `components.html` markup, a custom component's name and arguments. JavaScript is never executed, so `support: browser_required` marks the elements whose rendering depends on it: custom components, `components.html`, inline iframe HTML, and `st.html` with `unsafe_allow_javascript`. Static HTML is fully readable. A URL iframe reports its `src`; the page it embeds is not observed. `st.pdf` renders through the `streamlit-pdf` custom component and is reported as one. |
 | Download                       | Label, `file_name`, `mime` when the author set it, and the existing media URL. `st.download_button` with eager `data` already registers its bytes and carries a `url`, and its click — a rerun or the `on_click` callback — is an ordinary trigger, unless `on_click="ignore"` leaves nothing to fire. Only deferred generation, which carries a file ID instead of a URL, is unsupported. |
@@ -984,7 +987,10 @@ Charts and maps:
 
 - **A chart given a specification rather than a dataframe is `complete`.**
   `st.plotly_chart` and `st.echarts_chart` carry their values inside the specification,
-  so there is no table to serve and a client should stop looking for one.
+  so there is no table to serve and a client should stop looking for one. An ECharts
+  `dataset.source` dataframe is the exception: it travels as Arrow, so the chart reports
+  that table as a Vega-Lite chart over one dataframe does, and several such tables as
+  `unavailable: "multiple_datasets"`.
 - **Data a Vega-Lite specification loads from a URL is not served.** The browser fetches
   it and this interface does not, so the chart reports `complete: false` with
   `unavailable: "external_url"`, even beside a dataframe, and the URL stays in `spec`.
@@ -993,14 +999,17 @@ Charts and maps:
 - **Plotly's theme is dropped, its data is not.** Theme styling is about nine tenths of a
   small figure, so it is dropped and named in `spec_omitted`; content a template adds,
   such as a "DRAFT" annotation, a shape, or an image, is kept, since removing decoration
-  must not remove meaning. Base64 typed arrays (`bdata`), which a model cannot read, are
+  must not remove meaning. Title text a template sets for the figure, an axis, or the
+  legend is dropped with it in v1; keeping that text is a follow-up. The colors
+  `#000001` through `#000040`, such as each Plotly Express trace's `line.color`, are placeholders the
+  browser replaces with the app theme's colors, and can be ignored. Base64 typed arrays (`bdata`), which a model cannot read, are
   expanded into numbers. Nothing that holds data is dropped at any size: the traces are
-  the figure's data. Serving a large specification behind `data.url`, and an ECharts
-  `dataset.source` as Arrow as `st.map` serves its table, is follow-up #9.
-- **A rendering specification is not a data contract.** `st.map` compiles its points into
-  a Deck.gl layer, so a map's `data` is the columns it plots from the author's table,
-  which is all its browser receives, described like a dataframe's, and the generated
-  specification is left out.
+  the figure's data. Serving a large specification behind `data.url` is follow-up #9.
+- **A map reports the specification its browser renders.** `st.map` compiles the columns
+  it plots into a Deck.gl layer, and v1 reports that layer's specification as `spec`, as
+  `st.pydeck_chart` does. It carries every plotted point and nothing else from the
+  author's table, so the map is `complete`. Serving the plotted columns as Arrow,
+  described like a dataframe's, is follow-up #9.
 
 `data.url` and media URLs:
 
@@ -1040,31 +1049,30 @@ back to a browser rather than mistake it for missing content:
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Rendering that depends on JavaScript                                       | Custom components, `components.html`, inline iframe HTML, and `st.html` with scripts allowed report their source or arguments with `support: browser_required`, because what renders may differ from it, and cannot be driven. See [Data, charts, and media](#data-charts-and-media-in-v1). |
 | `st.file_uploader`, `st.camera_input`, `st.audio_input`                    | Interactive in the app. `support: action_unsupported`: this API reports the widget and cannot deliver the captured bytes.                                                                |
-| `st.chat_input` attachments                                                | Text only. `accept_file` and `accept_audio` are reported, but a request cannot attach files or audio.                                                                         |
+| `st.chat_input` attachments                                                | Text only. `accept_file` and `accept_audio` are reported, but a request cannot attach files or audio. Empty text is refused; the browser sends it only with files or audio.   |
 | `st.data_editor` edits, dataframe and chart selections, dataframe button columns | `support: action_unsupported`: the app can edit or select, and this API only reports that. On every data editor, and on a dataframe or chart only when the app enabled selections or added a button column. A display-only table or chart has no `support` field. |
 | Deferred downloads                                                         | `support: action_unsupported`: the browser generates the file on click, and this API has no URL to report until then. An eager download is fully supported.                       |
-| Lazy dataframe continuation                                                | `complete: false` with `unavailable: "lazy_loading"`; the loaded chunk is the preview.                                                                                        |
+| Lazy dataframe continuation                                                | `complete: false` with `unavailable: "lazy_loading"`; the preview is the first `server.agentPreviewRows` rows of the loaded chunk.                                            |
 | Data too large to hold a second copy of                                    | Over `server.maxMessageSize` per element, `data.unavailable: too_large_to_serve` instead of a `url`. See [Limits and configuration](#limits-and-configuration).              |
 | Chart data that is not one table                                           | A layered or concatenated Altair chart over several dataframes, or a Vega-Lite specification that loads data from a URL, reports its `spec` with `data.unavailable` (`multiple_datasets` or `external_url`) and serves none of the data, rather than part of it claimed as `complete`. |
+| Sources Streamlit collects only part of                                    | A table, chart, or map over a Snowpark, PySpark, Dask, or Modin DataFrame, a DuckDB relation, a database cursor, or another unevaluated source gets only its first 10,000 rows, or 100 in `st.table`, in the browser and in `data` alike. `data` reports those rows as the whole source: its `row_count`, `complete`, and `url` cover only them, and the "Showing only … rows" caption, a separate element, is the only sign of the cut. Lazily loading these sources, and reporting the cut where they still get one, are follow-ups. |
 | `run_every` fragment refresh                                               | Nothing refreshes until the client interacts again: the clock is the browser's, and background reruns on the server would be worse. The interval is not reported, since it would not change when a caller reruns and mostly invites a polling loop. |
 | `clear_on_submit`                                                          | Reported as authored and not applied — the reset is implemented in the browser. Fields keep their submitted values, so empty fields are not a submit signal, and a later submit that omits a field resends its old value: send every field with each submit. Follow-up #8. |
 | Validation only the browser performs                                       | `required` and `validate` are reported but not enforced, so an agent can submit an empty required field that a browser would block. A test that relies on them proves less than it appears to. [#16203](https://github.com/streamlit/streamlit/issues/16203) moves them server-side. |
 | Options that share a label                                                 | A value whose `format_func` label several options share is refused with `invalid_value` rather than resolved to one of them, so those options cannot be selected. A widget that accepts new options reads it as typed text and resolves it as it does for a browser. |
 | `bind="query-params"` write-back                                           | Setting a bound widget drops its parameter from `query_params` instead of rewriting it, until the app writes it back. See [Actions in v1](#actions-in-v1); follow-up #8.      |
 | Browser-supplied context (`st.context`, `st.user`)                         | `st.context.headers` are the request's, minus `Cookie`, `Authorization`, and `Proxy-Authorization`; cookies are empty, and the other fields are `None` except the timezone and locale a request states in `context`, and the offset derived from that timezone. `st.user` comes only from trusted identity headers, so an app behind `st.login` shows its signed-out state; see [Enablement](#enablement). |
-| Elements replayed from a cache a browser filled                            | An element an `st.cache_data` function emitted is replayed from the cache on later runs. If a browser session filled the entry, no description was recorded, so the element is reported by its proto field and listed in `undescribed_types`, and a table's rows beyond the preview are `unavailable: "undescribed"`. |
+| Elements replayed from a cache a browser filled                            | An element an `st.cache_data` function emitted is replayed from the cache on later runs. If a browser session filled the entry, no description was recorded, so the element is reported by its proto field and listed in `undescribed_types`, and a table's rows beyond the preview are `unavailable: "undescribed"`. A chart, a map, or a lazily loaded table reports no `data` then, since its command builds that while describing itself. |
 | Output shown while a run is in progress                                    | Only the end state is reported: an `st.spinner` never appears, and `st.write_stream` output arrives as the finished text rather than chunk by chunk. A toast the run raised does appear. See [v1 is one operation](#v1-is-one-operation). |
 | Reading without running, polling                                           | Every `interact` runs the script, apart from a retry that collects a timed-out run, which returns no partial results; one with no changes is an explicit rerun, and the last snapshot stays current until the client acts. Follow-up #4 adds a read and an operation handle. |
 
 ### Limits and configuration
 
-Every bound v1 applies, in one place. The session, timeout, and TTL options become
-public once the API is documented, so an operator can tune them, and stay hidden with
-`server.enableAgentApi` until then; the defaults are what v1 ships. The wait timeout
-bounds how long one request waits, not how long the run may take, so it sits below
-clients' own timeouts rather than growing to fit the slowest app. The preview size is a
-hidden option: the default is meant to be right, and the setting is there for operators
-and tests rather than for tuning per app.
+Every bound v1 applies, in one place. All agent API options are public, so operators
+can tune them; the defaults are what v1 ships. The wait timeout bounds how long one
+request waits, not how long the run may take, so it sits below clients' own timeouts
+rather than growing to fit the slowest app. The preview size's default is meant to be
+right; the setting is there for operators and tests rather than for tuning per app.
 
 | Limit                                  | Default                                               | Set by                                                                        |
 | -------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
@@ -1074,7 +1082,7 @@ and tests rather than for tuning per app.
 | Agent sessions held at once            | 100, then `too_many_sessions`                         | `server.agentMaxSessions`                                                     |
 | Interactions in flight per session     | 1, then `session_busy`                                | Fixed                                                                         |
 | Request body                           | 25 MB, then `request_too_large`; the bound on a message a browser sends | `server.maxWidgetStateSize`                                 |
-| Preview rows per table                 | 100                                                   | `server.agentPreviewRows` (hidden)                                            |
+| Preview rows per table                 | 100                                                   | `server.agentPreviewRows`                                                     |
 | Data served behind `data.url`          | 200 MB per element, then `too_large_to_serve`         | `server.maxMessageSize`, shared with the WebSocket                            |
 | Chart specification                    | No cap; the theme template is dropped                 | Fixed; follow-up #9 serves large ones behind `data.url`                       |
 | Response size                          | No cap                                                | Follow-up #9                                                                  |
@@ -1303,7 +1311,7 @@ than ranked, and say where one builds on another.
    `props.alt` — exactly the author-written meaning this interface exists to surface.
    What remains is the app and page level, for the snapshot to report: static
    `app_title`/`app_description` on `st.App`, the one reliable source of an app title;
-   `page_description` on `st.set_page_config` and optionally `st.Page`
+   one sentence per page as `help` on `st.Page`
    ([#16878](https://github.com/streamlit/streamlit/issues/16878)); and `help` on media
    ([#3133](https://github.com/streamlit/streamlit/issues/3133)).
 3. **Lazy continuation.** Range reads for lazy dataframes, reusing the existing chunk
@@ -1314,13 +1322,17 @@ than ranked, and say where one builds on another.
    most such requests want one. The read matters most for model clients: their context
    management drops or moves older tool results, and without it the only way back to
    the current state is a rerun, which can repeat side effects. Exposed through MCP
-   too, it lets `get_data` serve that result's files again. v1 already makes the common
-   timeout case safe — a retry after `wait_timed_out` collects the run instead of
-   repeating it — so what remains is general: optional `request_id` for retry
+   too, it gives a model that lost a result from its context that result's file URLs
+   again, for `get_data` to read while media storage keeps them. v1 already makes the
+   common timeout case safe — a retry after `wait_timed_out` collects the run instead
+   of repeating it — so what remains is general: optional `request_id` for retry
    idempotency beyond timeouts, including a lost response to a creating call,
    `expected_revision` to reject actions based on a stale observation, for callers that
    batch or parallelize, and letting a new action replace a run still going after
-   `wait_timed_out`, as a browser interaction would.
+   `wait_timed_out`, as a browser interaction would. Replacing a run still going comes
+   first: a page that runs for minutes, such as one whose first load fills a cold cache, answers every
+   other request on its session with `session_busy` until it finishes, so a client that
+   wants to leave it can only start a new session.
 5. **CLI.** `streamlit agent interact <url> --json @request.json` over the same routes, as
    a debugging and verification convenience. An agent with shell access can already curl
    the endpoint, which is why this is not v1.
@@ -1332,15 +1344,20 @@ than ranked, and say where one builds on another.
    ([MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)),
    and the specification's own guidance for this shape is the opaque-handle pattern
    `session_id` already implements. `interact` must never be annotated read-only. A
-   second, read-only `get_data` tool serves the files a result references, tables as
-   pages of rows, because chat clients cannot resolve or parse a `data.url`. Each tool
-   call takes the same path as an `interact` request, so its HTTP request's headers
-   supply `st.user` and `st.context.headers` in the same way. It is written by hand
-   rather than on the MCP SDK, which keeps it free of new dependencies. It speaks the
-   `initialize`-handshake revisions the common clients support, and adds `2026-07-28`,
-   whose stateless model `session_id` already follows, once they default to it. MCP is
-   how most AI applications connect to tools, so this belongs in the same release cycle
-   as v1 if possible, together with #9.
+   second, read-only `get_data` tool serves any media file the app still stores, such
+   as the files a result references, tables as pages of rows, because chat clients
+   cannot resolve or parse a `data.url`. An `interact` call takes the same path as
+   `POST /_stcore/agent/interact`, so its HTTP request's headers supply `st.user` and
+   `st.context.headers` in the same way; `get_data` only checks the session's identity,
+   then reads stored media. The endpoint is written by hand rather than on the MCP SDK,
+   which keeps it free of new dependencies. It speaks the `initialize`-handshake
+   revisions the common clients support, and adds `2026-07-28`, whose stateless model
+   `session_id` already follows, once they default to it. MCP is how most AI
+   applications connect to tools, so this belongs in the same release cycle as v1 if
+   possible. It does not wait for #9: local coding agents and most apps are unaffected
+   by the largest results. The
+   [MCP endpoint spec](../2026-10-15-agent-app-mcp-endpoint/product-spec.md) details
+   both tools.
 7. **Static app descriptor.** An authenticated route returning app title, description,
    and protocol capabilities _without_ executing app code, so an agent can choose among
    available apps. It depends on the authored `st.App` title/description in follow-up #2
@@ -1361,8 +1378,8 @@ than ranked, and say where one builds on another.
    already use, instead of staying inline: an oversized figure specification, option
    list, or text body — a long Markdown document, or its raw copy in a collapsed
    expander — is served behind a URL, readable through `get_data`, with the start of
-   it, `truncated: true`, and its full length or option count in the snapshot. An
-   ECharts `dataset.source` is served as Arrow, as `st.map` serves its table. Table
+   it, `truncated: true`, and its full length or option count in the snapshot.
+   `st.map`'s plotted columns are served as Arrow, as a dataframe's table is. Table
    previews get a byte budget beside the row cap, since a few long strings or nested
    values can make 100 rows enormous, and a request can ask for fewer preview rows; the
    preview then says `complete: false`, as it does past the row cap. Nothing that holds
@@ -1372,8 +1389,18 @@ than ranked, and say where one builds on another.
    Markdown document shown twice can pass half a megabyte. Through MCP every one of
    those bytes lands in a model's context, and a response over a client's tool-result
    limit is lost to the model, which makes this, with #6, the first follow-up to take
-   after v1. A cheap first step is to leave Plotly's base64 `bdata` arrays unexpanded
-   above a size threshold, which keeps every value, though not in a form a model reads.
+   after v1. Measured across a 21-page dashboard app, table previews are the largest
+   part of most snapshots (35 of 44 KB for one 15-column table), and option lists make
+   up most of the rest, so the preview's byte budget and a lower default row count,
+   around 20, come first. The `pages` list, about 2 KB, would then be sent only when it
+   differs from the session's previous result, since `unknown_page` already returns it.
+   Repeated
+   annotations shrink too: `fragment` only on keyed nodes and on the fragment's own
+   container, and documented defaults such as `label_visibility: "visible"` left out.
+   Leaving Plotly's base64 `bdata` arrays unexpanded saves less, since only numeric
+   arrays shrink, and hides those values from a model. A response with only what
+   changed is not planned: like a fragment's subtree, it would push merging onto every
+   client.
 10. **Agent sign-in for `st.login` apps.** In v1 an app that uses `st.login` shows
     agents its signed-out state: its identity is a signed cookie the browser gets at
     the end of the OAuth/OIDC redirect, which an agent cannot present. Every other
@@ -1387,11 +1414,20 @@ than ranked, and say where one builds on another.
     exactly as `st.login` does, fronting the provider as a thin OAuth proxy where it
     cannot register MCP clients itself. The HTTP API accepts the same token. App-issued
     API keys are what to avoid: they would be a second identity system.
+11. **Say what became of each sent value.** A value can be changed or dropped with a
+    `200`: a widget resets an out-of-range number or a malformed date to its default,
+    truncates a fraction sent to an integer input, and a key the same run removes or
+    re-keys loses its value, as when one value in a batch moves the bounds of a slider
+    whose generated key then changes. Agents evaluating v1 hit this on real pages and
+    noticed only from the page's own text. A result lists each sent key that did not
+    land as sent, with its reason (`reset`, `adjusted`, or `removed`, which also covers
+    a re-keyed key), and stays silent when every value landed.
+    [#16203](https://github.com/streamlit/streamlit/issues/16203) then turns most resets
+    into `invalid_value` refusals, leaving the removed and re-keyed cases for this list.
 
 Smaller potential follow-ups and alternatives considered:
 
-- **Values:** a per-key note on how each sent value landed, including a key the batch
-  itself removed; refusing values that do not match `value_schema` — a fraction for a
+- **Values:** refusing values that do not match `value_schema` — a fraction for a
   whole number, a malformed date, a too-short or reversed range — rather than letting
   the widget adjust them; widget constraints checked server-side
   ([#16203](https://github.com/streamlit/streamlit/issues/16203)); the limits a widget
@@ -1402,16 +1438,25 @@ Smaller potential follow-ups and alternatives considered:
   within them, best together with #16203 so the server refuses what the schema rules
   out; and integers beyond
   ±(2^53−1) as decimal strings, which JavaScript clients otherwise round.
+- **Actions:** a short `context` on an action whose `label` repeats on the page, such
+  as its nearest heading, since two "Show top" sliders are otherwise told apart only by
+  their place in `tree`. Author keys remain the better fix.
 - **Data:** running queries over a large table on the server instead of paging it to
   the model; recommending dataframe-backed charts for apps agents read; serving each
   dataset of a layered chart under `data.datasets`, with its own columns, preview, and
   URL, instead of `unavailable: multiple_datasets`; dropping an unnamed pandas index
   under `hide_index`, so `__index_level_0__` is not a meaningless extra column;
   reporting a media element's URL as `data.url`, as a table's is; describing `st.pdf`
-  as media rather than as the custom component it renders through; letting `get_data`
-  read the files of the last few results rather than only the latest; an HTTP route for
+  as media rather than as the custom component it renders through; keeping the last
+  few results' files in media storage for `get_data` after a later run replaces them;
+  an HTTP route for
   `get_data`, for HTTP clients without an Arrow reader that need rows beyond the
-  preview; and keeping only summaries in the session's message buffer.
+  preview; keeping only summaries in the session's message buffer; and lazily loading
+  unevaluated sources in `st.dataframe` instead of collecting their first 10,000 rows
+  ([#17707](https://github.com/streamlit/streamlit/issues/17707)), so `data` reports
+  the source's true row count with `unavailable: "lazy_loading"`, as for any lazy table,
+  while `st.table`, charts, and `st.map`, which would still cut the source, report the
+  cut with a new reason such as `truncated_source`.
 - **Sessions:** starting an agent session from a browser session's state, from widget
   values the page carries
   ([#17394](https://github.com/streamlit/streamlit/pull/17394)) or a fork that also
@@ -1427,8 +1472,9 @@ Smaller potential follow-ups and alternatives considered:
   fidelity harness covering every command.
 - **Testing:** layout facts such as `st.columns` weights, for a coding agent checking its
   own layout, which an e2e testing API would likely serve better than the snapshot.
-- **Operations:** usage metrics, which need a channel of their own because Streamlit's
-  usage stats are reported by the browser and an agent session has none; and an audit
+- **Operations:** usage metrics beyond the request and session counts that the
+  [agent API usage metrics tech spec](https://issues.streamlit.app/agent_wiki_explorer?file=pull-requests/17792/tech-spec.md)
+  adds, such as outcomes and latency, and counts from an app no browser opens; and an audit
   log of interactions without content: a digest of the session handle, the request
   fields used, the outcome, and the latency, never the handle, labels, values, or data.
 
@@ -1523,7 +1569,7 @@ v1 ships when:
 | Works on SiS, Cloud, etc?  | ⚠️ Opt-in, and served wherever the app is once on, behind the platform's own authentication. An app that reads the platform's request headers, such as a SiS caller's-rights token, gets each request's. An app behind `st.login` is anonymous to agents until agent sign-in lands (follow-up #10). Multi-worker deployments need session affinity, since an agent session lives in one process. Serving behind a hosting prefix that the proxy strips, as Community Cloud does, needs nothing from the platform, because every URL the API hands out is relative to the request. Discovery does: the public URL serves the platform's page rather than the app's, so the platform has to carry the hint. |
 | No breaking API changes    | ✅ Additive: `server.enableAgentApi`, off in v1, its budget options, new routes under `/_stcore/agent/`, and the discovery hint in `index.html`. No `st.*` signature changes. One behavior is sharper: an `st.context` field the client never sent reads as `None` rather than an empty default. Browser apps never see it, because the frontend always sends every field, and an explicitly sent `0` or `False` is kept, since the fields track presence. Flipping the default later is itself a reviewed change, not a silent one. |
 | No new dependencies        | ✅ Existing Starlette and JSON. The follow-up MCP endpoint needs none either, since it is written by hand rather than on the MCP SDK.                                                                                                                                                                                                                                                                                                                                                                                          |
-| Metrics collected          | Not in v1. Streamlit's usage stats are reported by the browser, which an agent session does not have, so agent usage needs a channel of its own; see the operations item in the smaller follow-ups.                                                                                                                                                                                                                                                                                                         |
+| Metrics collected          | Counts only, while `browser.gatherUsageStats` is on: agent requests, including those to an app with the API off, and sessions created, cumulative per server process under a random id. Streamlit's usage stats are reported by the browser, which an agent session does not have, so the counts ride on the page profiles of the app's browser sessions. No labels, keys, values, queries, URLs, or data. The content-free audit log is still a follow-up; see the operations item in the smaller follow-ups. |
 | Any security/legal impact? | ⚠️ Significant, and the main review risk. New execution surface: off by default in v1 with on-by-default as the goal, open to any program that can reach the app once on but refusing unlisted web origins, every interaction validated server-side, no session-state or secret exposure. The interface is an alternate encoding of what the browser protocol already exposes, so the review question is bulk-access practicality, request volume, and identity mapping — the gates on making it opt-out. App content is untrusted input to the calling agent, so no action may be annotated safe. |
 | Any docs changes needed?   | Protocol reference and coverage matrix, an authoring guide ("write `key=`, explain the app in the app"), verification guidance next to `AppTest` and Playwright, and a security/deployment page.                                                                                                                                                                                                                                                                                                              |
 | Any other risks?           | The snapshot is a compatibility surface for scripts that hard-code it; it carries `schema_version` and changes additively within it, while clients that read the served description pick up changes with each Streamlit release. Adoption risk: if it stays experimental too long, the ecosystem standardizes on browser automation instead.                                                                                                                                                                                                                                                               |

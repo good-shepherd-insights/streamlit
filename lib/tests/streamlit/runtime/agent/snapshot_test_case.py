@@ -18,17 +18,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 from zoneinfo import ZoneInfo
 
 import streamlit as st
-from streamlit.elements.lib import agent_spec
+from streamlit.elements.lib import agent_data, agent_spec
 from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
 from streamlit.runtime.agent.snapshot import (
     ElementState,
     Snapshot,
-    _public_key,
     build_snapshot,
+    public_key,
 )
 from tests.delta_generator_test_case import DeltaGeneratorTestCase
 
@@ -67,6 +67,15 @@ def _one_keyed(
     ]
     assert len(matches) == 1, matches
     return matches[0]
+
+
+def _assert_data_resolves(data: dict[str, Any]) -> None:
+    """The `data` invariant: complete, or a URL, or a known reason; never both."""
+    assert data["complete"] is True or "url" in data or "unavailable" in data, data
+    assert not ("url" in data and "unavailable" in data), data
+    if "unavailable" in data:
+        assert data["unavailable"] in get_args(agent_data.UnavailableReason), data
+        assert data["complete"] is False, data
 
 
 def _describe(path: list[int], body: dict[str, Any]) -> ForwardMsg:
@@ -148,7 +157,7 @@ def _state(snapshot: Snapshot, command: str, key: str) -> ElementState:
     matches = [
         state
         for element_id, state in snapshot.element_states.items()
-        if state.command == command and _public_key(element_id) == key
+        if state.command == command and public_key(element_id) == key
     ]
     assert len(matches) == 1, matches
     return matches[0]
@@ -174,7 +183,7 @@ class SnapshotCase(DeltaGeneratorTestCase):
         element_id = next(
             widget_id
             for widget_id in state._new_widget_state.widget_metadata
-            if _public_key(widget_id) == key
+            if public_key(widget_id) == key
         )
         state._new_widget_state.set_from_value(element_id, value)
 

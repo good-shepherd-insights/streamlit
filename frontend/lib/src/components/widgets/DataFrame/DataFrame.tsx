@@ -45,12 +45,13 @@ import {
   type Rectangle,
 } from "@glideapps/glide-data-grid"
 import { Resizable } from "re-resizable"
-import { createPortal } from "react-dom"
+import { createPortal, flushSync } from "react-dom"
 
 import {
   Dataframe as DataframeProto,
   type streamlit,
 } from "@streamlit/protobuf"
+import { isNullOrEmptyString } from "@streamlit/utils"
 
 import { BackendOperationContext } from "~lib/components/core/BackendOperationContext"
 import {
@@ -672,7 +673,7 @@ function DataFrame({
    * selectionState is absent so a later identical value can apply.
    */
   useEffect(() => {
-    if (!element.selectionState) {
+    if (isNullOrEmptyString(element.selectionState)) {
       processedSelectionStateRef.current = null
       return
     }
@@ -948,8 +949,10 @@ function DataFrame({
   // Name the grid (not the toolbar wrapper) only when alt is non-blank.
   // role="region" (not "img") exposes the name without making Glide's
   // operable canvas presentational.
-  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- blank alt must not become an accessible name
-  const accessibleName = element.alt?.trim() || undefined
+  const trimmedAlt = element.alt?.trim()
+  const accessibleName = isNullOrEmptyString(trimmedAlt)
+    ? undefined
+    : trimmedAlt
 
   return (
     <StyledResizableContainer
@@ -1120,7 +1123,7 @@ function DataFrame({
         data-testid="stDataFrameResizable"
         ref={resizableRef}
         aria-label={accessibleName}
-        {...(accessibleName ? { role: "region" } : {})}
+        {...(accessibleName !== undefined ? { role: "region" } : {})}
         defaultSize={resizableSize}
         style={{
           border: `${gridTheme.tableBorderWidth}px solid ${gridTheme.glideTheme.borderColor}`,
@@ -1147,6 +1150,24 @@ function DataFrame({
         }}
         grid={[1, rowHeight]}
         snapGap={rowHeight / 3}
+        onResizeStart={() => {
+          // Start the drag in pixels. re-resizable resizes in the unit of the
+          // size prop, and a percentage height ("100%" for stretch) can't grow
+          // the parent, so the table would overflow it during the drag.
+          if (
+            resizableRef.current &&
+            typeof resizableSize.height === "string"
+          ) {
+            const { height } = resizableRef.current.size
+            /* eslint-disable-next-line @eslint-react/dom-no-flush-sync --
+             * re-resizable reads the size prop right after this callback
+             * returns and uses that unit for the drag. Render the pixel height
+             * before returning. This runs once per drag. */
+            flushSync(() => {
+              setResizableSize(prev => ({ ...prev, height }))
+            })
+          }
+        }}
         onResizeStop={(_event, _direction, _ref, _delta) => {
           if (resizableRef.current) {
             const borderThreshold = 2 * gridTheme.tableBorderWidth
@@ -1421,7 +1442,7 @@ function DataFrame({
           })}
         />
       </Resizable>
-      {tooltip?.content && (
+      {tooltip !== undefined && (
         <Tooltip
           top={tooltip.top}
           left={tooltip.left}

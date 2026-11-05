@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from e2e_playwright.conftest import ImageCompareFunction
 
 
-NUM_SELECTBOXES = 31
+NUM_SELECTBOXES = 38
 
 
 def get_selectbox_input(
@@ -125,6 +125,10 @@ def test_selectbox_widget_rendering(
     assert_snapshot(
         get_selectbox(themed_app, "selectbox 19 (width='stretch')"),
         name="st_selectbox-width_stretch",
+    )
+    assert_snapshot(
+        get_selectbox(themed_app, "selectbox 27 (material icon)"),
+        name="st_selectbox-material_icon",
     )
 
 
@@ -934,3 +938,179 @@ def test_selectbox_on_change_ignore(app: Page):
     wait_for_app_loaded(app)
     expect(get_selectbox_input(app, "Ignore change selectbox")).to_have_value("beta")
     expect_prefixed_markdown(app, "Ignore selectbox value:", "beta")
+
+
+def test_selectbox_required_blocks_empty_form_submits_and_clearing(app: Page):
+    """Test that required gates empty form submits and blocks clearing a selection."""
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+    expect_markdown(app, "required form submitted: False")
+
+    country_widget = get_element_by_key(app, "required_country")
+    city_widget = get_element_by_key(app, "required_city")
+    country_input = country_widget.get_by_role("combobox")
+    expect(country_input).to_have_attribute("aria-required", "true")
+    expect(country_widget.get_by_test_id("stWidgetLabelRequired")).to_be_visible()
+    expect(country_widget.get_by_test_id("stSelectboxErrorIcon")).to_have_count(0)
+
+    # An empty form submit is blocked and every empty field shows the error.
+    submit_button = app.get_by_role(
+        "button", name="Submit required selectbox form", exact=True
+    )
+    submit_button.click()
+    expect(country_widget.get_by_role("alert")).to_have_text("This field is required.")
+    expect(city_widget.get_by_role("alert")).to_have_text("This field is required.")
+    expect(country_widget.get_by_test_id("stSelectboxErrorIcon")).to_be_visible()
+    expect(country_input).to_have_attribute("aria-invalid", "true")
+    expect_markdown(app, "required form submitted: False")
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+
+    # Selecting an option clears that field's error, but the other one still blocks.
+    select_selectbox_option(app, "Required country", "Germany")
+    expect(country_widget.get_by_role("alert")).to_have_count(0)
+    submit_button.click()
+    expect(city_widget.get_by_role("alert")).to_have_text("This field is required.")
+    expect(country_widget.get_by_role("alert")).to_have_count(0)
+    expect_markdown(app, "required form submitted: False")
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+
+    # Once every required field has a value, the form submits.
+    select_selectbox_option(app, "Required city", "Berlin")
+    submit_button.click()
+    wait_for_app_run(app)
+    expect_markdown(app, "required form submitted: True")
+    expect_markdown(app, "required country: Germany")
+    expect(app.get_by_text("Runs: 2", exact=True)).to_be_visible()
+    expect(city_widget.get_by_role("alert")).to_have_count(0)
+    # clear_on_submit resets the fields after the successful submit.
+    expect(country_input).to_have_value("")
+
+    # Outside a form, a required selectbox has no clear button.
+    color_widget = get_element_by_key(app, "required_color")
+    color_input = color_widget.get_by_role("combobox")
+    expect(color_widget.get_by_role("button", name="Clear value")).to_have_count(0)
+    select_selectbox_option(app, "Required color", "green")
+    expect_markdown(app, "required color: green")
+    expect(app.get_by_text("Runs: 3", exact=True)).to_be_visible()
+    expect(color_widget.get_by_role("button", name="Clear value")).to_have_count(0)
+
+    # Escape does not clear the selection.
+    color_input.click()
+    color_input.press("Escape")
+    expect(color_input).to_have_value("green")
+
+    # Deleting the text and blurring restores the selection without a rerun.
+    color_input.fill("")
+    color_input.blur()
+    expect(color_input).to_have_value("green")
+    wait_for_app_run(app)
+    expect_markdown(app, "required color: green")
+    expect(app.get_by_text("Runs: 3", exact=True)).to_be_visible()
+
+    # A different option, including a new one, can still replace the selection.
+    color_input.fill("purple")
+    color_input.press("Enter")
+    wait_for_app_run(app)
+    expect_markdown(app, "required color: purple")
+    expect(app.get_by_text("Runs: 4", exact=True)).to_be_visible()
+    # Outside a form there is no empty commit, so no error is ever shown.
+    expect(color_widget.get_by_role("alert")).to_have_count(0)
+
+    # A hidden label omits the marker but keeps aria-required.
+    hidden_widget = get_element_by_key(app, "required_hidden_select")
+    expect(hidden_widget.get_by_test_id("stWidgetLabelRequired")).to_have_count(0)
+    expect(hidden_widget.get_by_role("combobox")).to_have_attribute(
+        "aria-required", "true"
+    )
+
+
+def test_selectbox_required_marker_and_error_rendering(
+    themed_app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Snapshot the required marker and the required error chrome."""
+    widget = get_element_by_key(themed_app, "required_country")
+    expect(widget.get_by_test_id("stWidgetLabelRequired")).to_be_visible()
+    assert_snapshot(widget, name="st_selectbox-required_marker")
+
+    themed_app.get_by_role(
+        "button", name="Submit required selectbox form", exact=True
+    ).click()
+    expect(widget.get_by_test_id("stSelectboxErrorIcon")).to_be_visible()
+    assert_snapshot(widget, name="st_selectbox-required_error")
+
+
+def _get_text_start_x(input_locator: Locator) -> float:
+    """Return the x-coordinate where the text of an input element starts."""
+    return float(
+        input_locator.evaluate(
+            "el => el.getBoundingClientRect().left"
+            " + parseFloat(getComputedStyle(el).paddingLeft)"
+        )
+    )
+
+
+def test_selectbox_icon_alignment_and_interactions(app: Page):
+    """Test that the icon lines up with text and number input icons, passes clicks
+    to the input, and stays while typing.
+    """
+    # The icon and the text line up with st.text_input and st.number_input icons.
+    alignment = get_element_by_key(app, "icon_alignment")
+    text_input = alignment.get_by_test_id("stTextInput")
+    number_input = alignment.get_by_test_id("stNumberInput")
+    aligned_selectbox = get_selectbox(alignment, "aligned selectbox")
+    selectbox_icon_box = aligned_selectbox.get_by_test_id(
+        "stSelectboxIcon"
+    ).bounding_box()
+    assert selectbox_icon_box is not None
+    for other_icon in (
+        text_input.get_by_test_id("stTextInputIcon"),
+        number_input.get_by_test_id("stNumberInputIcon"),
+    ):
+        other_icon_box = other_icon.bounding_box()
+        assert other_icon_box is not None
+        assert abs(other_icon_box["x"] - selectbox_icon_box["x"]) <= 1
+        assert abs(other_icon_box["width"] - selectbox_icon_box["width"]) <= 1
+    selectbox_text_x = _get_text_start_x(aligned_selectbox.locator("input"))
+    for other_input in (text_input.locator("input"), number_input.locator("input")):
+        assert abs(_get_text_start_x(other_input) - selectbox_text_x) <= 1
+
+    label = "selectbox 28 (emoji icon, accept new options)"
+    selectbox = get_selectbox(app, label)
+    icon = selectbox.get_by_test_id("stSelectboxIcon")
+    expect(icon).to_be_visible()
+    expect_markdown(app, "value 28: None")
+
+    # Clicking the icon passes through to the input and opens the dropdown. The
+    # click's hit-target check fails if the icon intercepts pointer events.
+    combobox = selectbox.get_by_role("combobox")
+    # Scroll before clicking: React Aria closes the dropdown on scroll, so a
+    # scroll event that lands after the click would close it again.
+    combobox.scroll_into_view_if_needed()
+    expect(combobox).to_be_in_viewport()
+    icon_box = icon.bounding_box()
+    combobox_box = combobox.bounding_box()
+    assert icon_box is not None
+    assert combobox_box is not None
+    combobox.click(
+        position={
+            "x": icon_box["x"] - combobox_box["x"] + icon_box["width"] / 2,
+            "y": icon_box["y"] - combobox_box["y"] + icon_box["height"] / 2,
+        }
+    )
+    dropdown = app.get_by_test_id("stSelectboxVirtualDropdown")
+    expect(dropdown).to_be_visible()
+    expect(combobox).to_be_focused()
+
+    # The icon stays visible while typing a new option.
+    app.keyboard.type("Zed")
+    expect(dropdown.get_by_role("option", name="Add: Zed")).to_be_visible()
+    expect(icon).to_be_visible()
+
+    app.keyboard.press("Enter")
+    expect_markdown(app, "value 28: Zed")
+    expect(combobox).to_have_value("Zed")
+    expect(icon).to_have_count(1)
+
+    # Selectboxes without an icon render none.
+    expect(
+        get_selectbox(app, "selectbox 1 (default)").get_by_test_id("stSelectboxIcon")
+    ).to_have_count(0)

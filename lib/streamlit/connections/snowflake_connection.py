@@ -380,8 +380,9 @@ class SnowflakeConnection(BaseSnowflakeConnection):
     case. Use ``secrets.toml`` and ``**kwargs`` to configure your connection
     for local development.
 
-    When an app is running in Snowpark Container Services and has caller's rights
-    enabled, ``st.connection("snowflake-callers-rights")`` connects automatically
+    When an app is running in Snowpark Container Services or on Snowflake serverless
+    compute (``compute_resource: SERVERLESS``) and has caller's rights enabled,
+    ``st.connection("snowflake-callers-rights")`` connects automatically
     using the current user's identity tokens. This is a session-scoped connection
     to ensure that the identity stays tied to the active user. A caller's rights
     connection can only be used by the session that created it, and its
@@ -603,12 +604,17 @@ class SnowflakeConnection(BaseSnowflakeConnection):
 
     You can use ``"snowflake-callers-rights"`` type connections in any
     environment running on Snowpark Container Services, including Streamlit in
-    Snowflake on containers and any self-managed caller's rights Service.
+    Snowflake on containers and any self-managed caller's rights Service. They
+    also work on Snowflake serverless compute (``compute_resource: SERVERLESS``).
 
-    This will use the Snowpark-provided account, host, database, and schema to connect.
-    Additionally, it will set ``client_session_keep_alive`` to ``True``. These values
-    may be overridden with ``**kwargs`` in ``st.connection``. For a complete list
-    of keyword arguments, see the documentation for |snowflake.connector.connect()|_.
+    This will use the Snowpark-provided account and host to connect. If the
+    container sets a database, schema, protocol, or port, the connection uses
+    them too. Without a database and schema, the session has no default
+    namespace, so queries must use fully qualified table names.
+    Additionally, it will set ``client_session_keep_alive`` to ``True``. These
+    values may be overridden with ``**kwargs`` in ``st.connection``. For a
+    complete list of keyword arguments, see the documentation for
+    |snowflake.connector.connect()|_.
 
     .. |snowflake.connector.connect()| replace:: ``snowflake.connector.connect()``
     .. _snowflake.connector.connect(): https://docs.snowflake.com/en/developer-guide/python-connector/python-connector-api#label-snowflake-connector-methods-connect
@@ -737,8 +743,8 @@ def _is_module_being_imported() -> bool:
 class SnowflakeCallersRightsConnection(SnowflakeConnection):
     """A caller's rights connection to Snowflake using the Snowflake Connector for Python.
 
-    This will only work when running on Snowpark Container Services or another
-    compatible platform.
+    This will only work when running on Snowpark Container Services, Snowflake
+    serverless compute, or another compatible platform.
 
     See ``BaseSnowflakeConnection`` for complete docs.
     """
@@ -850,8 +856,9 @@ class SnowflakeCallersRightsConnection(SnowflakeConnection):
 
         Raises
         ------
-            StreamlitAPIException: if any Snowpark environment variables or connection
-            tokens are missing; or if this is called outside of a session context.
+            StreamlitAPIException: if ``SNOWFLAKE_ACCOUNT`` or ``SNOWFLAKE_HOST``
+            is unset, the Snowpark token file is missing, or the caller's rights
+            token header is missing.
         """
         # Local import needed to avoid cycles.
         from streamlit import context as st_context
@@ -871,8 +878,6 @@ class SnowflakeCallersRightsConnection(SnowflakeConnection):
         for param_name, env_var_name in (
             ("account", "SNOWFLAKE_ACCOUNT"),
             ("host", "SNOWFLAKE_HOST"),
-            ("database", "SNOWFLAKE_DATABASE"),
-            ("schema", "SNOWFLAKE_SCHEMA"),
         ):
             value = os.getenv(env_var_name)
             if value is None:
@@ -882,6 +887,23 @@ class SnowflakeCallersRightsConnection(SnowflakeConnection):
                     error_id="snowflake-env-var-not-found",
                 )
             params[param_name] = value
+
+        # Forward these only when the container sets them. The owner "snowflake"
+        # connection reads the same settings from the mounted default connection file.
+        # - Database and schema: some containers do not mount them. The session then
+        #   has no default namespace, so queries need fully qualified names.
+        # - Protocol and port: some containers route the connector through a local
+        #   proxy (for example, http and 8082). Otherwise the connector uses https
+        #   on port 443.
+        for param_name, env_var_name in (
+            ("database", "SNOWFLAKE_DATABASE"),
+            ("schema", "SNOWFLAKE_SCHEMA"),
+            ("protocol", "SNOWFLAKE_PROTOCOL"),
+            ("port", "SNOWFLAKE_PORT"),
+        ):
+            value = os.getenv(env_var_name)
+            if value is not None:
+                params[param_name] = value
 
         # Validate the token file exists, and read it.
         if not os.path.exists(SNOWPARK_CONNECTION_TOKEN_FILE):
@@ -902,10 +924,34 @@ class SnowflakeCallersRightsConnection(SnowflakeConnection):
             )
         user_token = st_context.headers[SNOWPARK_USER_TOKEN_HEADER_NAME]
 
-        # Build the actual caller's rights token.
-        params["token"] = f"{login_token}.{user_token}"
+        params["token"] = cls._build_callers_rights_token(login_token, user_token)
 
         return params
+
+    @staticmethod
+    def _build_callers_rights_token(login_token: str, user_token: str) -> str:
+        """Returns the OAuth token that authenticates as the calling user.
+
+        The mounted service token selects the format:
+
+        - Contains ``.``: Snowpark Container Services expects
+          ``<service token>.<user token>``.
+        - No ``.``: Snowflake serverless compute mounts an opaque service token, and
+          its user token header is already a complete caller's rights token, so the
+          header is used alone.
+
+        Whitespace around the service token, such as a trailing newline in the token
+        file, is ignored.
+        """
+        # Snowflake documents neither token's format, and no environment variable
+        # distinguishes serverless compute from Snowpark Container Services, so the
+        # service token's shape is the only available signal. The opaque, dotless
+        # serverless token and its complete header token were observed on a live
+        # serverless deployment.
+        login_token = login_token.strip()
+        if "." in login_token:
+            return f"{login_token}.{user_token}"
+        return user_token
 
     def _connect(self, **kwargs: Any) -> InternalSnowflakeConnection:
         import snowflake.connector  # type:ignore[import]

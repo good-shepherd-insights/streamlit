@@ -73,7 +73,7 @@ const generateAdditionalPage = (
     icons?: boolean
   }
 ): AppPage.$Properties => {
-  const { sectionHeaders, icons } = options
+  const { sectionHeaders, icons = false } = options
   const suffix = generatePageSuffix(pageIndex, totalPages)
 
   return {
@@ -214,6 +214,31 @@ describe("SidebarNav", () => {
 
     const nav = screen.getByRole("navigation", { name: "App pages" })
     expect(nav).toHaveAttribute("data-testid", "stSidebarNav")
+  })
+
+  it("describes each link with its page's help", () => {
+    renderSidebarNav(
+      {},
+      {
+        navigationContext: {
+          appPages: [
+            { ...generateMainPage(), help: "The app's start page." },
+            {
+              pageScriptHash: "other_page_hash",
+              pageName: "Other",
+              urlPathname: "other",
+            },
+          ],
+        },
+      }
+    )
+
+    expect(
+      screen.getByRole("link", { name: "streamlit app" })
+    ).toHaveAccessibleDescription("The app's start page.")
+    expect(screen.getByRole("link", { name: "Other" })).not.toHaveAttribute(
+      "aria-describedby"
+    )
   })
 
   describe("page links", () => {

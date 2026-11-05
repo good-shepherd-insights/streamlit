@@ -68,7 +68,7 @@ from streamlit.runtime.state import (
     register_widget,
     validate_on_change_mode,
 )
-from streamlit.string_util import to_help_str
+from streamlit.string_util import to_help_str, validate_icon_or_emoji
 from streamlit.type_util import check_python_comparable
 
 if TYPE_CHECKING:
@@ -188,7 +188,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[False] = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -211,7 +213,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[False] = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -234,7 +238,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[True] = True,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -257,7 +263,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[False] = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -280,7 +288,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[True] = True,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -308,7 +318,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: Literal[False] = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -331,7 +343,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: bool = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -354,7 +368,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: bool = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -482,11 +498,51 @@ class SelectboxMixin:
             An optional boolean that disables the selectbox if set to ``True``.
             The default is ``False``.
 
+        required : bool
+            An optional boolean that requires a selection if set to
+            ``True``. The default is ``False``. If this is ``True``, an
+            empty selection (``None``) cannot be submitted.
+
+            Inside a form, submission is blocked until the user selects an
+            option. Inside or outside a form, the user can change a
+            selection but can't clear it. The widget still returns its
+            default value until the user selects an option.
+
+            ``required=True`` does not change the widget's default. A
+            selectbox still starts on the option at ``index`` (the first
+            option by default). Use ``index=None`` together with
+            ``required=True`` for an empty required selectbox.
+
+            .. note::
+               This check runs in the user's browser and can be bypassed.
+               If requiredness is security-relevant, you must also check the
+               value on the server (in your app code) after it is submitted.
+
         label_visibility : "visible", "hidden", or "collapsed"
             The visibility of the label. The default is ``"visible"``. If this
             is ``"hidden"``, Streamlit displays an empty spacer instead of the
             label, which can help keep the widget aligned with other widgets.
             If this is ``"collapsed"``, Streamlit displays no label or spacer.
+
+        icon : str or None
+            An optional emoji or icon to display within the input field to the
+            left of the value. If ``icon`` is ``None`` (default), no icon is
+            displayed. If ``icon`` is a string, the following options are
+            valid:
+
+            - A single-character emoji. For example, you can set ``icon="🚨"``
+              or ``icon="🔥"``. Emoji short codes are not supported.
+
+            - An icon from the Material Symbols library (rounded style) in the
+              format ``":material/icon_name:"`` where "icon_name" is the name
+              of the icon in snake case.
+
+              For example, ``icon=":material/thumb_up:"`` will display the
+              Thumb Up icon. Find additional icons in the `Material Symbols \
+              <https://fonts.google.com/icons?icon.set=Material+Symbols&icon.style=Rounded>`_
+              font library.
+
+            - ``"spinner"``: Displays a spinner as an icon.
 
         accept_new_options : bool
             Whether the user can add a selection that isn't included in ``options``.
@@ -645,7 +701,9 @@ class SelectboxMixin:
             kwargs=kwargs,
             placeholder=placeholder,
             disabled=disabled,
+            required=required,
             label_visibility=label_visibility,
+            icon=icon,
             accept_new_options=accept_new_options,
             filter_mode=filter_mode,
             width=width,
@@ -668,7 +726,9 @@ class SelectboxMixin:
         *,  # keyword-only arguments:
         placeholder: str | None = None,
         disabled: bool = False,
+        required: bool = False,
         label_visibility: LabelVisibility = "visible",
+        icon: str | None = None,
         accept_new_options: bool = False,
         filter_mode: SelectWidgetFilterMode = "fuzzy",
         width: WidthWithoutContent = "stretch",
@@ -722,9 +782,11 @@ class SelectboxMixin:
         element_id = compute_and_register_element_id(
             "selectbox",
             user_key=key,
-            # Treat the provided key as the main identity. Only include
-            # accept_new_options in the identity computation because it can
-            # invalidate the current selection and is complex to support.
+            # A user key is the widget identity. With a key, only
+            # accept_new_options changes the ID, because it can invalidate the
+            # current selection and is complex to support. The other kwargs
+            # below, such as `required` and `icon`, change the ID of unkeyed
+            # widgets only.
             key_as_main_identity={"accept_new_options"},
             dg=self.dg,
             label=label,
@@ -735,6 +797,8 @@ class SelectboxMixin:
             accept_new_options=accept_new_options,
             filter_mode=filter_mode,
             width=width,
+            required=required,
+            icon=icon,
         )
 
         session_state = get_session_state().filtered_state
@@ -750,6 +814,7 @@ class SelectboxMixin:
         selectbox_proto.form_id = current_form_id(self.dg)
         selectbox_proto.placeholder = placeholder or ""
         selectbox_proto.disabled = disabled
+        selectbox_proto.required = required
         selectbox_proto.label_visibility.value = get_label_visibility_proto_value(
             label_visibility
         )
@@ -758,6 +823,9 @@ class SelectboxMixin:
 
         if help is not None:
             selectbox_proto.help = to_help_str(help)
+
+        if icon is not None:
+            selectbox_proto.icon = validate_icon_or_emoji(icon)
 
         # Set query param key if bound
         if bind == "query-params" and key is not None:
@@ -831,9 +899,10 @@ class SelectboxMixin:
                 key=element_id,
                 action="value",
                 value_schema=agent_spec.STRING,
-                # No initial selection: a later choice can be cleared back to
-                # the placeholder. `index` itself is only the starting value.
-                clearable=index is None,
+                # No initial selection, and not required: a later choice can be
+                # cleared back to the placeholder. `index` itself is only the
+                # starting value.
+                clearable=index is None and not required,
                 label=label,
                 # The formatted options, not the author's Python objects:
                 # these are the strings a client has to send back to set the
@@ -843,7 +912,12 @@ class SelectboxMixin:
                 # The wire form encodes an explicit empty placeholder as a
                 # single space; report what the author passed.
                 placeholder=placeholder if placeholder != " " else "",
+                icon=selectbox_proto.icon or None,
                 disabled=disabled,
+                # Checked by the browser, not by this interface: `null` still
+                # resets the widget to its default, which is empty for
+                # `index=None`.
+                required=required,
                 label_visibility=label_visibility,
                 accept_new_options=accept_new_options,
                 filter_mode=filter_mode,

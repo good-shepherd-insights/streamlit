@@ -479,11 +479,8 @@ class TestSnowflakeCallersRightsConnection:
         env_var_names = [
             "SNOWFLAKE_ACCOUNT",
             "SNOWFLAKE_HOST",
-            "SNOWFLAKE_DATABASE",
-            "SNOWFLAKE_SCHEMA",
         ]
 
-        # Validate that we throw an exception if any env vars are missing.
         for missing_var in env_var_names:
 
             def fake_getenv(key: str) -> str | None:
@@ -517,20 +514,42 @@ class TestSnowflakeCallersRightsConnection:
             with pytest.raises(StreamlitAPIException, match="Token header not found"):
                 SnowflakeCallersRightsConnection._get_connection_params()
 
-    def test_get_connection_params_all_values_ok(self):
-        """Tests that correct parameters are generated when all values are present."""
+    @pytest.mark.parametrize(
+        ("extra_env", "expected_extra"),
+        [
+            pytest.param(
+                {
+                    "SNOWFLAKE_DATABASE": "my_database",
+                    "SNOWFLAKE_SCHEMA": "streamlit_schema",
+                    "SNOWFLAKE_PROTOCOL": "http",
+                    "SNOWFLAKE_PORT": "8082",
+                },
+                {
+                    "database": "my_database",
+                    "schema": "streamlit_schema",
+                    "protocol": "http",
+                    "port": "8082",
+                },
+                id="optional-env-set",
+            ),
+            pytest.param({}, {}, id="optional-env-unset"),
+        ],
+    )
+    def test_get_connection_params_includes_optional_env_only_when_set(
+        self, extra_env: dict[str, str], expected_extra: dict[str, str]
+    ) -> None:
+        """The connection includes optional environment variables only when the container sets them."""
 
         fake_env_values = {
             "SNOWFLAKE_ACCOUNT": "my-account",
             "SNOWFLAKE_HOST": "account.snowf.com",
-            "SNOWFLAKE_DATABASE": "my_database",
-            "SNOWFLAKE_SCHEMA": "streamlit_schema",
+            **extra_env,
         }
 
-        def fake_getenv(key: str) -> str:
+        def fake_getenv(key: str) -> str | None:
             return fake_env_values.get(key)
 
-        fake_file_token = "ondisk_secret"
+        fake_file_token = "ondisk.service.jwt"
         fake_header_token = "header_secret"
         fake_headers = {SNOWPARK_USER_TOKEN_HEADER_NAME: fake_header_token}
 
@@ -552,9 +571,8 @@ class TestSnowflakeCallersRightsConnection:
             "client_session_keep_alive": True,
             "account": "my-account",
             "host": "account.snowf.com",
-            "database": "my_database",
-            "schema": "streamlit_schema",
-            "token": "ondisk_secret.header_secret",
+            **expected_extra,
+            "token": f"{fake_file_token}.{fake_header_token}",
         }
 
     @pytest.mark.require_integration
@@ -721,6 +739,32 @@ class TestSnowflakeCallersRightsConnectionUnit:
             str(token_path),
         ):
             assert SnowflakeCallersRightsConnection._read_token_file() == "login-token"
+
+    @pytest.mark.parametrize(
+        ("login_token", "user_token", "expected"),
+        [
+            # Snowpark Container Services: a dotted service token is combined with
+            # the user token.
+            ("service.jwt.token", "user-token", "service.jwt.token.user-token"),
+            # Surrounding whitespace is dropped before the tokens are combined.
+            ("service.jwt.token\n", "user-token", "service.jwt.token.user-token"),
+            # Serverless: an opaque service token means the user token is complete.
+            ("opaque-service-token", "user-token", "user-token"),
+            ("opaque-service-token\n", "user-token", "user-token"),
+            # A complete serverless user token may itself contain dots.
+            ("opaque-service-token", "header.payload.sig", "header.payload.sig"),
+        ],
+    )
+    def test_build_callers_rights_token(
+        self, login_token: str, user_token: str, expected: str
+    ) -> None:
+        """A dotted service token is joined to the user token; an opaque one is not."""
+        assert (
+            SnowflakeCallersRightsConnection._build_callers_rights_token(
+                login_token, user_token
+            )
+            == expected
+        )
 
     def test_connect_merges_generated_params_with_kwargs(self) -> None:
         """``_connect`` sets qmark paramstyle and lets kwargs override generated params."""

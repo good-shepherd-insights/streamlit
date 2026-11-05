@@ -45,8 +45,9 @@ from streamlit.logger import get_logger
 from streamlit.proto.ClientState_pb2 import ClientState, ContextInfo
 from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
 from streamlit.runtime import RuntimeState
-from streamlit.runtime.agent import snapshot, widget_writes
+from streamlit.runtime.agent import snapshot, usage, widget_writes
 from streamlit.runtime.agent.errors import AgentRequestError
+from streamlit.runtime.scriptrunner_utils.run_descriptor import RunDescriptor
 from streamlit.runtime.scriptrunner_utils.script_run_context import ThreadState
 from streamlit.runtime.scriptrunner_utils.script_run_context_attr import (
     SCRIPT_RUN_CONTEXT_ATTR_NAME,
@@ -207,8 +208,15 @@ class AgentSessionClient(SessionClient):
         msg_type = msg.WhichOneof("type")
 
         if msg_type == "new_session":
-            self._run_id = msg.new_session.script_run_id
-            self._fragments_this_run = frozenset(msg.new_session.fragment_ids_this_run)
+            run = RunDescriptor.from_metadata(msg.metadata)
+            # Without identity the run gets an empty ID and counts as a full-app
+            # run, so its finish drops every delta from earlier runs.
+            if run is None:
+                _LOGGER.warning(
+                    "Agent session client got a new_session without run identity."
+                )
+            self._run_id = run.script_run_id if run else ""
+            self._fragments_this_run = frozenset(run.fragment_ids if run else ())
             self._element_at = {}
 
         if msg_type == "delta":
@@ -304,16 +312,20 @@ class AgentSessionClient(SessionClient):
 # timed-out click collects its run rather than firing the click again.
 _ACTION_FIELDS: Final = ("widget_state", "trigger", "page", "query_params", "context")
 
-# Every field an `interact` request may carry.
-_REQUEST_FIELDS: Final = frozenset({"session_id", *_ACTION_FIELDS})
+# Every field an `interact` request may carry, and the fields of its `trigger`
+# and `context`. The OpenAPI document lists the same names in this order, so a
+# field the validator accepts is always documented.
+REQUEST_FIELDS: Final = ("session_id", *_ACTION_FIELDS)
+TRIGGER_FIELDS: Final = ("key", "value")
+CONTEXT_FIELDS: Final = ("timezone", "locale")
 
 # Generous for a BCP 47 tag with extensions, which is what a browser reports.
-_MAX_LOCALE_LENGTH: Final = 64
+MAX_LOCALE_LENGTH: Final = 64
 
 # The shape of a BCP 47 language tag: a language, then hyphenated subtags, as
 # in "de-DE" or "zh-Hans-CN". Not a POSIX locale such as "en_US.UTF-8", which a
 # browser never reports and a locale library would refuse.
-_LANGUAGE_TAG: Final = re.compile(r"[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*")
+LANGUAGE_TAG: Final = re.compile(r"[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*")
 
 
 @functools.cache
@@ -461,6 +473,9 @@ class AgentSessionRegistry:
 
         if self._sweeper is None or self._sweeper.done():
             self._sweeper = asyncio.get_running_loop().create_task(self._sweep())
+        # Count the session only now that it is set up, so a creation refused
+        # at the cap or failed during setup counts nothing.
+        usage.record("sessions")
         return session
 
     def get(self, handle: str, user_info: UserInfoType) -> AgentSession:
@@ -475,7 +490,7 @@ class AgentSessionRegistry:
         self._reclaim_idle()
         session = self._sessions.get(handle)
         if session is None or session.user_info != user_info:
-            ttl = _duration(float(config.get_option("server.agentSessionTTL")))
+            ttl = format_duration(float(config.get_option("server.agentSessionTTL")))
             raise AgentRequestError(
                 "unknown_session",
                 "This session does not exist or has expired: sessions end after "
@@ -567,6 +582,7 @@ async def interact(
     registry: AgentSessionRegistry,
     request: dict[str, Any],
     *,
+    transport: usage.Transport,
     user_info: UserInfoType,
     headers: Iterable[tuple[str, str]],
     encode: Callable[[dict[str, Any]], bytes],
@@ -584,6 +600,9 @@ async def interact(
         The agent sessions to create the interaction's session in or find it.
     request : dict[str, Any]
         The parsed request body.
+    transport : "http" or "mcp"
+        The route the request arrived on. Each call counts once on this
+        transport's usage counter, whatever its outcome.
     user_info : UserInfoType
         What the deployment's trusted identity headers say about the caller,
         mapped the way the WebSocket maps them for a browser.
@@ -605,6 +624,8 @@ async def interact(
         For every refusal the error catalog lists. A creating call that fails
         after its session exists carries that session's handle.
     """
+    # Count before validating, so a refused request still counts as agent usage.
+    usage.record_interaction(transport)
     # Off the event loop, since it walks every string in a body that can be as
     # large as a message from the browser.
     parsed = await asyncio.to_thread(_validate_request_shape, request)
@@ -632,7 +653,7 @@ async def interact(
                 raise AgentRequestError(
                     "wait_timed_out",
                     "The app has finished, but its snapshot was still being "
-                    f"built after {_duration(_wait_timeout())}. Nothing is lost: "
+                    f"built after {format_duration(_wait_timeout())}. Nothing is lost: "
                     "send a request with only `session_id` to collect it.",
                     session_id=session.handle,
                 ) from None
@@ -642,9 +663,9 @@ async def interact(
     if session.busy:
         raise AgentRequestError(
             "session_busy",
-            "This session already has an interaction in flight. If it is one "
-            "whose response you lost, send only `session_id` in a moment to "
-            "collect it.",
+            "This session already has an interaction in flight. Wait for its "
+            "response. If its client timed out or disconnected, send only "
+            "`session_id` in a moment to collect it.",
         )
     session.busy = True
     session.released.clear()
@@ -686,8 +707,12 @@ def _wait_timeout() -> float:
     return float(config.get_option("server.agentWaitTimeout"))
 
 
-def _duration(seconds: float) -> str:
-    """Phrase a number of seconds for an error message, such as "15 minutes"."""
+def format_duration(seconds: float) -> str:
+    """Format ``seconds`` as a short phrase, such as ``15 minutes``.
+
+    An exact non-zero number of minutes is phrased in minutes. Every other
+    duration is phrased in seconds.
+    """
     if seconds and seconds % 60 == 0:
         amount, unit = seconds / 60, "minute"
     else:
@@ -751,8 +776,9 @@ async def _run_interaction(
         # owed to the client that started it.
         raise AgentRequestError(
             "session_busy",
-            "This session is still running an interaction that timed out. "
-            "Send only `session_id` to wait for it, then send this request.",
+            "This session is still running an interaction that timed out or "
+            "whose client disconnected. Send only `session_id` to wait for it, "
+            "then send this request.",
         )
     if pending is not None:
         # Its result goes uncollected, but its run happened, so this request
@@ -945,8 +971,8 @@ async def _wait_and_build(
         # The run can settle in the same loop iteration the timeout fires in.
         if not app_session.is_settled:
             session.timed_out = interaction
-            timeout = _duration(_wait_timeout())
-            elapsed = _duration(round(time.monotonic() - interaction.started))
+            timeout = format_duration(_wait_timeout())
+            elapsed = format_duration(round(time.monotonic() - interaction.started))
             raise AgentRequestError(
                 "wait_timed_out",
                 f"The app did not finish within {timeout}, and is still "
@@ -1165,11 +1191,20 @@ class _ParsedRequest(NamedTuple):
 def _validate_request_shape(request: dict[str, Any]) -> _ParsedRequest:
     """Refuse a malformed request before anything is allocated or run."""
     _refuse_invalid_text(request)
-    unknown = set(request) - _REQUEST_FIELDS
+    unknown = set(request).difference(REQUEST_FIELDS)
     if unknown:
         raise AgentRequestError(
             "invalid_request",
             f"Unknown request fields: {', '.join(sorted(unknown))}.",
+        )
+    # Any `session_id`, even `null`, means continue: a client that lost its
+    # handle must not silently get a fresh session. Checked before
+    # `_refuse_malformed_writes`, which treats a `null` `session_id` as a
+    # creating call.
+    if "session_id" in request and not isinstance(request["session_id"], str):
+        raise AgentRequestError(
+            "invalid_request",
+            "`session_id` must be a string. Omit it to create a session.",
         )
     _refuse_malformed_writes(request)
 
@@ -1179,9 +1214,6 @@ def _validate_request_shape(request: dict[str, Any]) -> _ParsedRequest:
         raise AgentRequestError("invalid_request", "`page` must be a string.")
     query_params = request.get("query_params")
     query_string = None if query_params is None else _encode_query_params(query_params)
-    session_id = request.get("session_id")
-    if session_id is not None and not isinstance(session_id, str):
-        raise AgentRequestError("invalid_request", "`session_id` must be a string.")
     context = request.get("context")
     return _ParsedRequest(
         context=None if context is None else _parse_context(context),
@@ -1206,10 +1238,10 @@ def _refuse_malformed_writes(request: dict[str, Any]) -> None:
         if not isinstance(trigger, dict):
             raise AgentRequestError(
                 "invalid_request",
-                "`trigger` must be an object with a `key`, and at most one may "
-                "be sent.",
+                "`trigger` must be an object, `{key, value?}`. Send one "
+                "trigger per request.",
             )
-        if extra := set(trigger) - {"key", "value"}:
+        if extra := set(trigger).difference(TRIGGER_FIELDS):
             raise AgentRequestError(
                 "invalid_request",
                 f"Unknown `trigger` fields: {', '.join(sorted(extra))}. A trigger "
@@ -1278,8 +1310,11 @@ def _resolve_page(
             or [
                 {
                     "url_path": info.get("url_pathname", ""),
-                    **({"title": info["page_name"]} if info.get("page_name") else {}),
+                    # Always set, even when empty: the OpenAPI `Page` schema
+                    # requires `title`, as in the snapshot's `pages`.
+                    "title": info.get("page_name", ""),
                     **({"icon": info["icon"]} if info.get("icon") else {}),
+                    **({"help": info["help"]} if info.get("help") else {}),
                 }
                 for info in pages.values()
             ]
@@ -1403,12 +1438,13 @@ def _parse_context(context: Any) -> ContextInfo:
     """
     if not isinstance(context, dict):
         raise AgentRequestError("invalid_request", "`context` must be an object.")
-    unknown = set(context) - {"timezone", "locale"}
+    unknown = set(context).difference(CONTEXT_FIELDS)
     if unknown:
+        supported = ", ".join(f"`{name}`" for name in CONTEXT_FIELDS)
         raise AgentRequestError(
             "invalid_request",
             f"Unknown `context` fields: {', '.join(sorted(unknown))}. Supported: "
-            "`timezone`, `locale`.",
+            f"{supported}.",
         )
 
     info = ContextInfo()
@@ -1436,8 +1472,8 @@ def _parse_context(context: Any) -> ContextInfo:
     if locale is not None:
         if (
             not isinstance(locale, str)
-            or len(locale) > _MAX_LOCALE_LENGTH
-            or not _LANGUAGE_TAG.fullmatch(locale)
+            or len(locale) > MAX_LOCALE_LENGTH
+            or not LANGUAGE_TAG.fullmatch(locale)
         ):
             raise AgentRequestError(
                 "invalid_request",

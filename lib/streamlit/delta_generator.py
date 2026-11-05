@@ -347,13 +347,6 @@ class DeltaGenerator(
         # If this an `st.form` block, this will get filled in.
         self._form_data: FormData | None = None
 
-        # Change the module of all mixin'ed functions to be st.delta_generator,
-        # instead of the original module (e.g. st.elements.markdown)
-        for mixin in self.__class__.__bases__:
-            for func in mixin.__dict__.values():
-                if callable(func):
-                    func.__module__ = self.__module__
-
     def __repr__(self) -> str:
         return util.repr_(self)
 
@@ -528,6 +521,29 @@ class DeltaGenerator(
         dg = self._active_dg
         return str(dg._cursor.delta_path) if dg._cursor is not None else "[]"
 
+    def _get_write_delta_path_str(self) -> str:
+        """Return the delta path where this DeltaGenerator's next element is written.
+
+        Unlike ``_get_delta_path_str``, this follows a fragment's write to a
+        container declared outside it into the wrapper block ``_enqueue``
+        redirects it to. The outside container's own cursor advances only once
+        for that wrapper, so it would give every such element the same path.
+        """
+        dg = self._active_dg
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            ts = ThreadState.get()
+            if ts.fragment_id and _needs_outside_wrapper(dg, ts, ctx.fragment_storage):
+                wrapper = ctx.fragment_storage.get_outside_wrapper(
+                    ts.fragment_id, dg._id
+                )
+                if wrapper is None:
+                    # `_enqueue` creates the wrapper at this cursor's position,
+                    # and the element becomes its first child.
+                    return str([*cast("Cursor", dg._cursor).delta_path, 0])
+                dg = wrapper.delta_generator
+        return str(dg._cursor.delta_path) if dg._cursor is not None else "[]"
+
     def _enqueue(
         self,
         delta_type: str,
@@ -667,6 +683,19 @@ class DeltaGenerator(
         block_type = block_proto.WhichOneof("type")
 
         if dg._root_container is None or dg._cursor is None:
+            # Without a script run context (for example, python app.py),
+            # return a fresh dg_type instance so subclass methods such as
+            # GridContainer.cell() work and nested containers don't share state.
+            if dg_type is not None:
+                return cast(
+                    "DeltaGenerator",
+                    dg_type(
+                        root_container=None,
+                        cursor=None,
+                        parent=dg,
+                        block_type=block_type,
+                    ),
+                )
             return dg
 
         ctx = get_script_run_ctx()

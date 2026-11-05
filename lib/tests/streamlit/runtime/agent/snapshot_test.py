@@ -168,6 +168,38 @@ class SnapshotBuilderTest(SnapshotCase):
             "second",
         ]
 
+    def test_grid_keeps_cells_in_source_order(self) -> None:
+        """Direct children and grouped cells nest under the grid, unflattened."""
+        grid = st.grid(3, key="kpis", row_height=120, dense=True)
+        grid.markdown("direct")
+        with grid.cell(column_span="all"):
+            st.markdown("title")
+            st.caption("subtitle")
+
+        @st.fragment
+        def write_into_grid() -> None:
+            grid.markdown("from fragment")
+
+        write_into_grid()
+
+        document = self._build().document
+        assert "undescribed_types" not in document
+        grid_node = _one(document, "grid")
+        assert grid_node["key"] == "kpis"
+        assert "props" not in grid_node
+        assert [child["type"] for child in grid_node["children"]] == [
+            "markdown",
+            "cell",
+            "markdown",
+        ]
+        cell = _one(document, "cell")
+        assert "props" not in cell
+        assert [child["props"]["body"] for child in cell["children"]] == [
+            "title",
+            "subtitle",
+        ]
+        assert grid_node["children"][2]["props"]["body"] == "from fragment"
+
     def test_undescribed_elements_are_named_after_their_proto_field(self) -> None:
         """A gap stays visible, and a widget's value does not leak through it."""
         element = ForwardMsg()
@@ -236,7 +268,10 @@ class SnapshotBuilderTest(SnapshotCase):
         )
         assert "table" not in by_key
         assert _one(document, "dataframe")["support"] == "action_unsupported"
-        assert "data" not in _one(document, "dataframe")
+        # Selections are reported, not driven, and the table's data still is.
+        table_data = _one(document, "dataframe")["data"]
+        assert table_data["complete"] is True
+        assert table_data["url"].startswith("/media/")
         assert by_key["save"]["kind"] == "trigger"
         assert "later" not in by_key
         assert (
@@ -354,6 +389,9 @@ class SnapshotBuilderTest(SnapshotCase):
     def test_clearable_records_an_empty_default_the_value_hides(self) -> None:
         """A chosen value hides an empty default, so `clearable` says null empties it."""
         st.selectbox("City", ["Paris"], index=None, key="optional_city")
+        st.selectbox(
+            "Needed city", ["Paris"], index=None, required=True, key="needed_city"
+        )
         st.selectbox("Home", ["Paris"], key="home_city")
         st.radio("Choice", ["a"], index=None, key="choice")
         st.number_input("Count", value=None, key="count")
@@ -370,6 +408,9 @@ class SnapshotBuilderTest(SnapshotCase):
         optional = _one_keyed(snapshot.document, "selectbox", "optional_city")
         assert optional["clearable"] is True
         assert _state(snapshot, "selectbox", "optional_city").clearable is True
+        assert "clearable" not in _one_keyed(
+            snapshot.document, "selectbox", "needed_city"
+        )
         assert "clearable" not in _one_keyed(
             snapshot.document, "selectbox", "home_city"
         )
@@ -620,6 +661,63 @@ class SnapshotBuilderTest(SnapshotCase):
         navigated["page"]["title"] = "changed"
         assert navigated["pages"][1]["title"] == "Reports"
 
+    def test_pages_report_their_help(self) -> None:
+        """Each page entry, and the current page, carries the page's help. A
+        page without help has no `help` key."""
+        navigation = ForwardMsg()
+        navigation.navigation.page_script_hash = "main"
+        home = navigation.navigation.app_pages.add()
+        home.page_script_hash = "main"
+        home.page_name = "Home"
+        home.url_pathname = ""
+        home.help = "Net revenue by **region**."
+        reports = navigation.navigation.app_pages.add()
+        reports.page_script_hash = "reports"
+        reports.page_name = "Reports"
+        reports.url_pathname = "reports"
+        archive = navigation.navigation.app_pages.add()
+        archive.page_script_hash = "archive"
+        archive.page_name = "Archive"
+        archive.url_pathname = "archive"
+        archive.is_hidden = True
+        archive.help = "Closed periods."
+
+        document = self._build(navigation).document
+        assert document["pages"] == [
+            {"url_path": "", "title": "Home", "help": "Net revenue by **region**."},
+            {"url_path": "reports", "title": "Reports"},
+            {
+                "url_path": "archive",
+                "title": "Archive",
+                "help": "Closed periods.",
+                "hidden": True,
+            },
+        ]
+        assert document["page"] == document["pages"][0]
+
+    def test_hidden_pages_are_listed_and_marked(self) -> None:
+        """A page hidden from the menu still opens by its URL, so it is listed,
+        marked `hidden`. A page in the menu has no `hidden` key."""
+        navigation = ForwardMsg()
+        navigation.navigation.page_script_hash = "admin"
+        home = navigation.navigation.app_pages.add()
+        home.page_script_hash = "main"
+        home.page_name = "Home"
+        home.url_pathname = ""
+        admin = navigation.navigation.app_pages.add()
+        admin.page_script_hash = "admin"
+        admin.page_name = "Admin"
+        admin.url_pathname = "admin"
+        admin.is_hidden = True
+
+        document = self._build(navigation).document
+
+        assert document["pages"] == [
+            {"url_path": "", "title": "Home"},
+            {"url_path": "admin", "title": "Admin", "hidden": True},
+        ]
+        assert document["page"] == document["pages"][1]
+
     def test_external_navigation_links_are_not_pages(self) -> None:
         """An external link is not a destination the app can switch to."""
         navigation = ForwardMsg()
@@ -640,8 +738,8 @@ class SnapshotBuilderTest(SnapshotCase):
 
 
 def test_rebase_media_urls_rewrites_media_props_throughout_the_tree() -> None:
-    """Media and static file URLs in url, src, and avatar get the prefix, in lists
-    and nested nodes.
+    """Media and static file URLs in url, src, avatar, and data.url get the prefix,
+    in lists and nested nodes.
     """
     document: dict[str, Any] = {
         "tree": {
@@ -663,6 +761,10 @@ def test_rebase_media_urls_rewrites_media_props_throughout_the_tree() -> None:
                         },
                         {"type": "iframe", "props": {"src": "/media/e.html"}},
                         {"type": "video", "props": {"url": "/app/static/f.mp4"}},
+                        {
+                            "type": "dataframe",
+                            "data": {"complete": False, "url": "/media/g"},
+                        },
                     ],
                 }
             ],
@@ -671,12 +773,15 @@ def test_rebase_media_urls_rewrites_media_props_throughout_the_tree() -> None:
 
     rebase_media_urls(document, paths=("/media", "/app/static"), prefix="../..")
 
-    image, chat_message, iframe, video = document["tree"]["children"][0]["children"]
+    image, chat_message, iframe, video, dataframe = document["tree"]["children"][0][
+        "children"
+    ]
     assert image["props"]["url"] == ["../../media/a.png", "../../app/static/b.png"]
     assert chat_message["props"]["avatar"] == "../../media/c.png"
     assert chat_message["children"][0]["props"]["url"] == "../../media/d.wav"
     assert iframe["props"]["src"] == "../../media/e.html"
     assert video["props"]["url"] == "../../app/static/f.mp4"
+    assert dataframe["data"]["url"] == "../../media/g"
 
 
 def test_rebase_media_urls_leaves_other_values_untouched() -> None:
@@ -696,6 +801,10 @@ def test_rebase_media_urls_leaves_other_values_untouched() -> None:
                 {"type": "audio", "props": {"url": "/app/staticfiles/x.wav"}},
                 {"type": "chat_message", "props": {"name": "user", "avatar": "🧑"}},
                 {"type": "markdown", "props": {"body": "![](/media/z.png)"}},
+                {
+                    "type": "dataframe",
+                    "data": {"complete": False, "url": "https://example.com/media/x"},
+                },
             ],
         }
     }

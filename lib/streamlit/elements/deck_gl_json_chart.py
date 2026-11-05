@@ -33,7 +33,7 @@ from streamlit.deprecation_util import (
     make_deprecated_name_warning,
     show_deprecation_warning,
 )
-from streamlit.elements.lib import agent_spec
+from streamlit.elements.lib import agent_data, agent_spec
 from streamlit.elements.lib.form_utils import current_form_id
 from streamlit.elements.lib.layout_utils import (
     HeightWithoutContent,
@@ -680,8 +680,10 @@ class PydeckMixin:
                     key=pydeck_proto.id,
                     support="action_unsupported",
                     selection_mode=selection_mode,
-                    on_select="ignore" if on_select == "ignore" else "rerun",
+                    # A callback reaches the server too, so it is "rerun".
+                    on_select="rerun",
                     alt=pydeck_proto.alt or None,
+                    data_builder=lambda: _pydeck_data(pydeck_proto),
                 ),
             )
 
@@ -694,8 +696,8 @@ class PydeckMixin:
             agent_props=agent_spec.element(
                 "pydeck_chart",
                 key=key,
-                on_select="ignore" if on_select == "ignore" else "rerun",
                 alt=pydeck_proto.alt or None,
+                data_builder=lambda: _pydeck_data(pydeck_proto),
             ),
         )
 
@@ -703,6 +705,21 @@ class PydeckMixin:
     def dg(self) -> DeltaGenerator:
         """The associated DeltaGenerator."""
         return cast("DeltaGenerator", self)
+
+
+def _pydeck_data(pydeck_proto: PydeckProto) -> dict[str, Any] | None:
+    """A Deck.gl chart's agent ``data``: its spec, with the tooltip it shows.
+
+    The tooltip travels beside the spec in its own proto field, so it is put
+    back under the `pdk.Deck` argument's name, ``tooltip``.
+    """
+    data = agent_data.raw_spec(pydeck_proto.json)
+    if data is None or not pydeck_proto.tooltip:
+        return data
+    spec = data["spec"]
+    if isinstance(spec, dict):
+        data["spec"] = {**spec, "tooltip": json.loads(pydeck_proto.tooltip)}
+    return data
 
 
 def _get_pydeck_width(pydeck_obj: Deck | None) -> int | None:

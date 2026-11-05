@@ -19,7 +19,7 @@ Compile with: `make protobuf`
 ```protobuf
 message ForwardMsg {
   string hash = 1;                    // Unique hash for caching
-  ForwardMsgMetadata metadata = 2;    // delta_path, active_script_hash, agent_props
+  ForwardMsgMetadata metadata = 2;    // delta_path, active_script_hash, agent_props, run
 
   oneof type {
     NewSession new_session = 4;
@@ -49,9 +49,16 @@ message ForwardMsgMetadata {
   repeated uint32 delta_path = 2;
   string active_script_hash = 4;
   optional string agent_props = 5;    // JSON command description
+  RunIdentity run = 6;                // script_run_id, fragment_ids
   // ... more fields
 }
 ```
+
+**Run identity** (`metadata.run`: run ID + fragment IDs):
+- Set on `new_session` and `script_finished`; a `script_finished` omits it when the backend can't tell which run finished.
+- `ScriptRunner` creates one `RunDescriptor` (`lib/streamlit/runtime/scriptrunner_utils/run_descriptor.py`) per run and sends it on the run's start and finish events; `AppSession` copies it onto the messages.
+- The frontend reads it via `frontend/app/src/util/runIdentity.ts`.
+- Deltas carry none: they belong to the most recent `new_session`.
 
 **Semantics**:
 - Backend sets `metadata.active_script_hash` from `ScriptRunContext.active_script_hash`
@@ -64,7 +71,7 @@ message ForwardMsgMetadata {
 
 Agent sessions store a command description on `ForwardMsg.metadata.agent_props` for the snapshot described in `specs/2026-08-28-agent-app-interface/product-spec.md`.
 
-`ForwardMsgMetadata.agent_props` is a JSON description of the command that emitted the delta: public command name, parameter-named `props`, and for widgets `action` and `value_schema`. The command builds it with `agent_spec.element(...)` or `agent_spec.block(...)` in the same function that fills its proto. Prop values are encoded in `lib/streamlit/runtime/agent/json_encoding.py`.
+`ForwardMsgMetadata.agent_props` is a JSON description of the command that emitted the delta: public command name, parameter-named `props`, and for widgets `action` and `value_schema`. The command builds it with `agent_spec.element(...)` or `agent_spec.block(...)` in the same function that fills its proto. Prop values are encoded in `lib/streamlit/runtime/agent/json_encoding.py`. A table, chart, or map also adds `data`, built while recording with `elements/lib/agent_data.py`: a schema and a bounded preview, or the chart's specification, and for one eager Arrow dataset a `url`, the media-storage URL of an Arrow copy registered for agent sessions only. Lazy, oversized, multi-dataset, and URL-loaded data get no `url`. The snapshot copies `data` from the description; only a table replayed without a description is summarized from its payload. Cache replay registers the Arrow copies again only when an agent session replays the element.
 
 `element` and `block` return `None` unless `agent_spec.register_agent_session` has marked the current session. `agent_spec.is_recording()` is that check: a marked session is recording, meaning each command attaches its description. A browser session on the same server is not recording, so its messages carry none.
 

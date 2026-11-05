@@ -27,6 +27,7 @@ import * as MobileUtil from "~lib/util/isMobile"
 import { LabelVisibilityOptions } from "~lib/util/utils"
 
 import Selectbox, { getInsertedText, type Props } from "./Selectbox"
+import * as UseSyncEnterTargetFocus from "./useSyncComboBoxEnterTargetFocus"
 
 vi.mock("~lib/WidgetStateManager")
 
@@ -884,6 +885,45 @@ describe("Selectbox widget", () => {
     expect(props.onChange).toHaveBeenCalledWith(null)
   })
 
+  it("clears the committed value via the clear button", async () => {
+    const user = userEvent.setup()
+    props = getProps({ value: "b", clearable: true })
+    render(<Selectbox {...props} />)
+    const input = screen.getByRole("combobox")
+    expect(input).toHaveValue("b")
+
+    await user.click(screen.getByRole("button", { name: "Clear value" }))
+
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    expect(props.onChange).toHaveBeenCalledWith(null)
+    expect(input).toHaveValue("")
+    expect(
+      screen.queryByRole("button", { name: "Clear value" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument()
+  })
+
+  it.each(["ArrowDown", "ArrowUp"])(
+    "opens the dropdown on %s after keyboard focus",
+    async key => {
+      const user = userEvent.setup()
+      render(<Selectbox {...props} />)
+
+      await user.tab()
+      expect(screen.getByRole("combobox")).toHaveFocus()
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument()
+
+      await user.keyboard(`{${key}}`)
+
+      await waitFor(() => {
+        expect(screen.getAllByRole("option")).toHaveLength(
+          props.options.length
+        )
+      })
+      expect(props.onChange).not.toHaveBeenCalled()
+    }
+  )
+
   it("updates value if new value provided from parent", () => {
     const { rerender } = render(<Selectbox {...props} />)
     expect(screen.getByDisplayValue(props.options[0])).toBeVisible()
@@ -891,6 +931,18 @@ describe("Selectbox widget", () => {
     props = getProps({ value: "b" })
     rerender(<Selectbox {...props} />)
     expect(screen.getByDisplayValue(props.options[1])).toBeVisible()
+  })
+
+  it("clears the input if the parent resets the value to null", () => {
+    const { rerender } = render(<Selectbox {...props} />)
+    const input = screen.getByRole("combobox")
+    expect(input).toHaveValue("a")
+
+    props = getProps({ value: null })
+    rerender(<Selectbox {...props} />)
+
+    expect(input).toHaveValue("")
+    expect(props.onChange).not.toHaveBeenCalled()
   })
 
   it("preserves value after prop change and blur without selection", async () => {
@@ -1076,6 +1128,86 @@ describe("Selectbox widget", () => {
     await user.keyboard("{enter}")
     expect(props.onChange).not.toHaveBeenCalled()
   })
+
+  describe("before React Aria focuses the Enter target", () => {
+    beforeEach(() => {
+      // Stub the focus-sync hook so React Aria's focusedKey stays empty
+      // after typing. That exercises Selectbox's keyboard fallbacks for
+      // Enter and ArrowDown.
+      vi.spyOn(
+        UseSyncEnterTargetFocus,
+        "useSyncComboBoxEnterTargetFocus"
+      ).mockImplementation(() => undefined)
+    })
+
+    it("commits the first match on Enter", async () => {
+      const user = userEvent.setup()
+      props = getProps({
+        value: undefined,
+        options: ["apple", "apricot", "banana"],
+      })
+      render(<Selectbox {...props} />)
+      const input = screen.getByRole("combobox")
+
+      await user.click(input)
+      await user.type(input, "apr")
+      expect(input).not.toHaveAttribute("aria-activedescendant")
+      await user.keyboard("{Enter}")
+
+      expect(props.onChange).toHaveBeenCalledTimes(1)
+      expect(props.onChange).toHaveBeenCalledWith("apricot")
+      expect(input).toHaveValue("apricot")
+      await waitFor(() => {
+        expect(screen.queryByRole("listbox")).not.toBeInTheDocument()
+      })
+    })
+
+    it("commits the typed text as a new option on Enter", async () => {
+      const user = userEvent.setup()
+      props = getProps({
+        value: undefined,
+        options: ["apple"],
+        acceptNewOptions: true,
+      })
+      render(<Selectbox {...props} />)
+      const input = screen.getByRole("combobox")
+
+      await user.click(input)
+      await user.type(input, "xyz")
+      expect(input).not.toHaveAttribute("aria-activedescendant")
+      await user.keyboard("{Enter}")
+
+      expect(props.onChange).toHaveBeenCalledTimes(1)
+      expect(props.onChange).toHaveBeenCalledWith("xyz")
+      expect(input).toHaveValue("xyz")
+      await waitFor(() => {
+        expect(screen.queryByRole("listbox")).not.toBeInTheDocument()
+      })
+    })
+
+    it("skips the leading Add row on ArrowDown", async () => {
+      const user = userEvent.setup()
+      props = getProps({
+        value: undefined,
+        options: ["apple-0", "apple-1"],
+        acceptNewOptions: true,
+      })
+      render(<Selectbox {...props} />)
+      const input = screen.getByRole("combobox")
+
+      await user.click(input)
+      await user.type(input, "a")
+      expect(screen.getAllByRole("option")[0]).toHaveTextContent(/Add: a/i)
+      expect(input).not.toHaveAttribute("aria-activedescendant")
+
+      await user.keyboard("{ArrowDown}")
+      await expectActiveOption(input, "apple-0")
+      await user.keyboard("{Enter}")
+
+      expect(props.onChange).toHaveBeenCalledTimes(1)
+      expect(props.onChange).toHaveBeenCalledWith("apple-0")
+    })
+  })
 })
 
 describe("Selectbox widget with optional props", () => {
@@ -1107,6 +1239,172 @@ describe("Selectbox widget with optional props", () => {
 
     // "AA" is case-sensitively distinct from "aa", "Aa", "aA" → Add option shown
     expect(screen.getByRole("option", { name: /Add: AA/i })).toBeVisible()
+  })
+})
+
+describe("Selectbox required and error props", () => {
+  const ERROR_MESSAGE = "This field is required."
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it("renders no required or error chrome by default", () => {
+    render(<Selectbox {...getProps()} />)
+
+    const input = screen.getByRole("combobox")
+    expect(input).not.toHaveAttribute("aria-required")
+    expect(input).not.toHaveAttribute("aria-invalid")
+    expect(input).not.toHaveAttribute("aria-describedby")
+    expect(screen.getByRole("group")).not.toHaveAttribute("data-invalid")
+    expect(
+      screen.queryByTestId("stWidgetLabelRequired")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("stSelectboxErrorIcon")
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("shows the required marker and sets aria-required when required", () => {
+    render(<Selectbox {...getProps({ required: true })} />)
+
+    expect(screen.getByTestId("stWidgetLabelRequired")).toHaveTextContent(
+      "(required)"
+    )
+    const input = screen.getByRole("combobox")
+    expect(input).toHaveAttribute("aria-required", "true")
+    // Required alone is not an error.
+    expect(input).not.toHaveAttribute("aria-invalid")
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it.each([LabelVisibilityOptions.Hidden, LabelVisibilityOptions.Collapsed])(
+    "omits the required marker but keeps aria-required when the label is %s",
+    labelVisibility => {
+      render(<Selectbox {...getProps({ required: true, labelVisibility })} />)
+
+      expect(
+        screen.queryByTestId("stWidgetLabelRequired")
+      ).not.toBeInTheDocument()
+      expect(screen.getByRole("combobox")).toHaveAttribute(
+        "aria-required",
+        "true"
+      )
+    }
+  )
+
+  it("shows the invalid chrome and announces the error", () => {
+    render(
+      <Selectbox
+        {...getProps({ value: null, required: true, error: ERROR_MESSAGE })}
+      />
+    )
+
+    expect(screen.getByTestId("stSelectboxErrorIcon")).toBeVisible()
+    const alert = screen.getByRole("alert")
+    expect(alert).toHaveTextContent(ERROR_MESSAGE)
+    const input = screen.getByRole("combobox")
+    expect(input).toHaveAttribute("aria-invalid", "true")
+    expect(input.getAttribute("aria-describedby")?.split(" ")).toContain(
+      alert.getAttribute("id")
+    )
+    expect(screen.getByRole("group")).toHaveAttribute("data-invalid")
+  })
+
+  it("does not clear a committed value on Escape when not clearable", async () => {
+    const user = userEvent.setup()
+    const props = getProps({
+      options: ["Apple", "Banana", "Cherry"],
+      value: "Banana",
+      clearable: false,
+      required: true,
+    })
+    render(<Selectbox {...props} />)
+    const input = screen.getByRole("combobox")
+
+    expect(
+      screen.queryByRole("button", { name: "Clear value" })
+    ).not.toBeInTheDocument()
+
+    await user.click(input)
+    await user.keyboard("{Escape}")
+
+    expect(props.onChange).not.toHaveBeenCalled()
+    expect(input).toHaveValue("Banana")
+  })
+
+  it("never commits null for a custom value when not clearable", async () => {
+    const user = userEvent.setup()
+    const props = getProps({
+      options: ["red", "green"],
+      value: "purple",
+      clearable: false,
+      required: true,
+      acceptNewOptions: true,
+    })
+    render(<Selectbox {...props} />)
+    const input = screen.getByRole("combobox")
+    expect(input).toHaveValue("purple")
+
+    await user.click(input)
+    await user.keyboard("{Escape}")
+    expect(input).toHaveValue("purple")
+
+    await user.clear(input)
+    await user.click(document.body)
+
+    expect(props.onChange).not.toHaveBeenCalled()
+    await waitFor(() => {
+      expect(input).toHaveValue("purple")
+    })
+  })
+})
+
+describe("Selectbox icon", () => {
+  it("renders no icon by default", () => {
+    render(<Selectbox {...getProps()} />)
+
+    expect(screen.queryByTestId("stSelectboxIcon")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["an emoji", "👤", "stIconEmoji", "👤"],
+    ["a material icon", ":material/public:", "stIconMaterial", "public"],
+  ])(
+    "renders %s as a decorative icon",
+    (_description, icon, iconTestId, expectedText) => {
+      render(<Selectbox {...getProps({ icon })} />)
+
+      expect(screen.getByTestId("stSelectboxIcon")).toBeVisible()
+      const iconElement = screen.getByTestId(iconTestId)
+      expect(iconElement).toHaveTextContent(expectedText)
+      expect(iconElement).toHaveAttribute("aria-hidden", "true")
+    }
+  )
+
+  it("keeps the icon while typing a new option", async () => {
+    const user = userEvent.setup()
+    render(
+      <Selectbox
+        {...getProps({ icon: "👤", acceptNewOptions: true, value: undefined })}
+      />
+    )
+
+    await user.type(screen.getByRole("combobox"), "zz")
+
+    expect(screen.getByRole("option", { name: /Add: zz/i })).toBeVisible()
+    // getByTestId throws on duplicates, so this also checks for a single icon.
+    expect(screen.getByTestId("stSelectboxIcon")).toBeVisible()
+  })
+
+  it("keeps the icon when disabled", () => {
+    render(
+      <Selectbox {...getProps({ icon: ":material/lock:", disabled: true })} />
+    )
+
+    expect(screen.getByRole("combobox")).toBeDisabled()
+    expect(screen.getByTestId("stSelectboxIcon")).toBeVisible()
   })
 })
 
