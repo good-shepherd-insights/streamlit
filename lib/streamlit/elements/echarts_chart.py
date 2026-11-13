@@ -199,9 +199,11 @@ class EChartsSelectionState(ReadOnlyAttributeDictionary):
         ``"node"``, or ``"edge"``.
 
         ``data_indices`` is sorted and series-local. For a dataset without
-        transforms, it addresses ``dataset.source`` rows. For inline series,
-        it addresses ``series.data``. For graph series, ``data_type="node"``
-        addresses ``data`` and ``data_type="edge"`` addresses ``links``.
+        transforms, it addresses ``dataset.source`` rows. With a ``filter``
+        transform, it gives positions among the filtered rows, which keep their
+        source order. For inline series, it addresses ``series.data``. For
+        graph series, ``data_type="node"`` addresses ``data`` and
+        ``data_type="edge"`` addresses ``links``.
 
     areas : list[dict[str, Any]]
         The active brush regions. Each entry contains ``brush_index``,
@@ -1109,6 +1111,16 @@ class EChartsMixin:
         `Apache ECharts <https://echarts.apache.org/>`_ is a powerful, open-source
         charting library with a large catalog of chart types (including gauges,
         sunbursts, sankey, graph/network, candlestick, radar, and more).
+        Streamlit ships with Apache ECharts 6.1.
+
+        ``st.echarts_chart`` is the recommended command for new charts,
+        including dashboards. It follows the app's theme, animates when the
+        data changes, and stays fast with large datasets. Add a ``dataZoom``
+        component for a zoom slider, and use ``on_select`` with
+        ``selectedMode`` or a brush for selections. For a quick chart without
+        customization, the built-in chart commands (``st.line_chart``,
+        ``st.bar_chart``, ``st.area_chart``, and ``st.scatter_chart``) are a
+        shorter alternative.
 
         To show an ECharts chart in Streamlit, pass an ECharts
         `option object <https://echarts.apache.org/en/option.html>`_ as a Python
@@ -1130,7 +1142,10 @@ class EChartsMixin:
             raise an error: ``custom`` series (which require a ``renderItem``
             callback), map and geo charts (which require registering GeoJSON map
             data), and 3D or WebGL charts from the ECharts GL extension
-            (``bar3D``, ``scatter3D``, ``globe``, and similar).
+            (``bar3D``, ``scatter3D``, ``globe``, and similar). For range bars
+            such as Gantt charts, use a ``lines`` series with
+            ``"coordinateSystem": "cartesian2d"`` and set ``xAxis.min`` and
+            ``xAxis.max`` instead of a ``custom`` series.
 
         .. note::
             Strings in the option object (``title.text``, legend names, labels)
@@ -1229,8 +1244,9 @@ class EChartsMixin:
               becomes a float). Arrays and missing values such as ``NaN``,
               ``pd.NaT``, and ``pd.NA`` raise an error instead of becoming
               ``null``.
-            - Show data: The chart's hover toolbar has a **Show data** button
-              that displays the dataframe as a table.
+            - Show data: When the option uses one dataframe, the chart's hover
+              toolbar has a **Show data** button that displays it as a table.
+              With several dataframes, the button is hidden.
 
             Streamlit keeps the dataframe's column order through
             ``dataset.dimensions`` when you haven't set it. The dataframe index
@@ -1320,9 +1336,18 @@ class EChartsMixin:
             If selections are activated and ``key`` is provided, Streamlit
             will register the key in Session State to store the selection
             state, and the selection survives changes to your ``spec``,
-            ``theme``, and ``renderer``. Indices are not revalidated against
-            the new data, so check them before indexing. The selection state
-            is read-only. For more details, see `Widget behavior
+            ``theme``, and ``renderer``. When the data changes, a brush
+            selection updates to the points now inside its region. Streamlit
+            then reruns the app (or the chart's fragment) once to report them
+            and calls ``on_select`` if it's a callable. The run this starts
+            does not rerun again. Data that changes on every run still adds
+            one extra rerun each time something else triggers a run, such as
+            each ``run_every`` tick of the chart's fragment. Inside a form,
+            the update waits for submit.
+            Clicked points (``selectedMode``) keep their indices even if
+            different rows now sit at those positions, so check them before
+            indexing. The selection state is read-only. For more details, see
+            `Widget behavior
             <https://docs.streamlit.io/develop/concepts/architecture/widget-behavior>`_.
 
             If ``key`` is provided, it will be used as a CSS class name

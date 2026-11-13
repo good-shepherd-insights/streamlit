@@ -16,7 +16,7 @@
 
 import { type ReactElement, useMemo } from "react"
 
-import { screen } from "@testing-library/react"
+import { act, screen } from "@testing-library/react"
 import { userEvent } from "@testing-library/user-event"
 import {
   Float64,
@@ -42,6 +42,7 @@ import { WidgetStateManager } from "~lib/WidgetStateManager"
 
 import { EChartsChart } from "./EChartsChart"
 import { resetPageWheelClockForTests } from "./insideDataZoomWheel"
+import { resetChartFontsForTests } from "./useChartFontsReady"
 
 const LOG = getLogger("EChartsChart")
 
@@ -292,6 +293,65 @@ describe("EChartsChart", () => {
     expect(mockChart.resize).toHaveBeenCalledTimes(1)
   })
 
+  it("waits for the theme fonts before the first layout", async () => {
+    let resolveLoad: () => void = () => undefined
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        check: vi.fn(() => false),
+        load: vi.fn(
+          () =>
+            new Promise<void>(resolve => {
+              resolveLoad = resolve
+            })
+        ),
+      },
+    })
+
+    try {
+      render(<Wrapper element={createElement()} />)
+      // Measuring text now would cache the fallback font's widths.
+      expect(mockInit).not.toHaveBeenCalled()
+
+      await act(async () => {
+        resolveLoad()
+        await Promise.resolve()
+      })
+
+      expect(mockInit).toHaveBeenCalledTimes(1)
+      expect(mockChart.setOption).toHaveBeenCalledTimes(1)
+    } finally {
+      Object.defineProperty(document, "fonts", {
+        configurable: true,
+        value: undefined,
+      })
+      resetChartFontsForTests()
+    }
+  })
+
+  it("doesn't wait for fonts when theme is None", () => {
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        check: vi.fn(() => false),
+        // Never settles, so only a chart that skips the wait can init.
+        load: vi.fn(() => new Promise<void>(vi.fn())),
+      },
+    })
+
+    try {
+      // An unthemed chart uses ECharts' own fonts.
+      render(<Wrapper element={createElement({ theme: "" })} />)
+      expect(mockInit).toHaveBeenCalledTimes(1)
+    } finally {
+      Object.defineProperty(document, "fonts", {
+        configurable: true,
+        value: undefined,
+      })
+      resetChartFontsForTests()
+    }
+  })
+
   it("prunes pixel-only brush when a new instance inits at a different size", () => {
     const createIsolatedMockChart = (): typeof mockChart => {
       const chart = {
@@ -422,7 +482,15 @@ describe("EChartsChart", () => {
     )
 
     expect(mockInit).toHaveBeenCalledTimes(1)
-    expect(mockChart.on).not.toHaveBeenCalled()
+    // Only the restore's own hit-test listener is added, and it is removed
+    // right away.
+    const listeners = mockChart.on.mock.calls
+    const eventNames = listeners.map(([eventName]) => eventName)
+    expect(eventNames).not.toContain("selectchanged")
+    expect(eventNames).not.toContain("brushEnd")
+    for (const [eventName, handler] of listeners) {
+      expect(mockChart.off).toHaveBeenCalledWith(eventName, handler)
+    }
     // Disabled bind still restores the overlay so a disconnect / setOption
     // cannot drop the highlight. Handlers stay unbound.
     expect(mockChart.dispatchAction).toHaveBeenCalledWith({
@@ -1456,9 +1524,34 @@ describe("EChartsChart", () => {
       }
     )
 
-    it("does not offer Show data without Arrow datasets", () => {
-      render(<Wrapper element={createElement()} />)
+    it.each([
+      { name: "without Arrow datasets", createChartElement: createElement },
+      {
+        name: "for several Arrow datasets",
+        createChartElement: () =>
+          createDatasetElement({
+            spec: JSON.stringify({
+              dataset: [
+                { source: { name: "h1" } },
+                { source: { name: "h2" } },
+              ],
+              xAxis: { type: "category" },
+              yAxis: {},
+              series: [
+                { type: "bar", datasetIndex: 0 },
+                { type: "bar", datasetIndex: 1 },
+              ],
+            }),
+            datasets: [
+              namedDataset("h1", SALES_BYTES),
+              namedDataset("h2", NEW_SALES_BYTES),
+            ],
+          }),
+      },
+    ])("does not offer Show data $name", ({ createChartElement }) => {
+      render(<Wrapper element={createChartElement()} />)
 
+      expect(mockChart.setOption).toHaveBeenCalledTimes(1)
       expect(
         screen.queryByRole("button", { name: "Download as PNG" })
       ).toBeInTheDocument()
