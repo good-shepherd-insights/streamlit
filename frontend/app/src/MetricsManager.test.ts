@@ -429,6 +429,65 @@ describe("metrics helpers", () => {
     expect(atServerStart.serverUptimeSeconds).toBe("0")
   })
 
+  it("buildEventProto forwards parallelFragmentUsage through toJSON - pageProfile", async () => {
+    const mm = getMetricsManager()
+    await mm.initialize({ gatherUsageStats: true })
+
+    const withUsage = mm
+      .buildEventProto(
+        "pageProfile",
+        decodedPageProfile({
+          parallelFragmentUsage: {
+            runs: [{ startTime: 10, execTime: 900, cacheComputeTime: 600 }],
+            runCount: 1,
+            cacheUsage: { cacheData: { calls: 1, misses: 1 } },
+            waitTime: 700,
+          },
+        })
+      )
+      .toJSON()
+    const withoutUsage = mm
+      .buildEventProto("pageProfile", decodedPageProfile({ execTime: 5 }))
+      .toJSON()
+
+    expect(withUsage.parallelFragmentUsage).toStrictEqual({
+      runs: [{ startTime: "10", execTime: "900", cacheComputeTime: "600" }],
+      runCount: "1",
+      cacheUsage: { cacheData: { calls: "1", misses: "1" } },
+      waitTime: "700",
+    })
+    expect(withoutUsage).not.toHaveProperty("parallelFragmentUsage")
+  })
+
+  it("buildEventProto forwards arrowBytes and receivedMessages through toJSON - pageProfile", async () => {
+    const mm = getMetricsManager()
+    await mm.initialize({ gatherUsageStats: true })
+
+    const withData = mm
+      .buildEventProto("pageProfile", {
+        ...decodedPageProfile({ arrowBytes: 5_000 }),
+        receivedMessages: {
+          bytes: 6_000,
+          cachedMessages: 1,
+          cachedBytes: 3_000,
+        },
+      })
+      .toJSON()
+    const withoutData = mm
+      .buildEventProto("pageProfile", decodedPageProfile({ arrowBytes: 0 }))
+      .toJSON()
+
+    expect(withData.arrowBytes).toBe("5000")
+    expect(withData.receivedMessages).toStrictEqual({
+      bytes: "6000",
+      cachedMessages: "1",
+      cachedBytes: "3000",
+    })
+    // The field is optional, so a run without data still sends 0.
+    expect(withoutData.arrowBytes).toBe("0")
+    expect(withoutData).not.toHaveProperty("receivedMessages")
+  })
+
   it("buildEventProto populates expected fields - menuClick", async () => {
     const mm = getMetricsManager()
     await mm.initialize({ gatherUsageStats: true })

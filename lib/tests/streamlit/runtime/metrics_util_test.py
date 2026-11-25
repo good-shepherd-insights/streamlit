@@ -20,6 +20,7 @@ import contextvars
 import inspect
 import sys
 import threading
+import time
 import unittest
 from collections import Counter
 from datetime import date, datetime
@@ -27,12 +28,13 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, mock_open, patch
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 from parameterized import parameterized
 
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit import config
+from streamlit import config, dataframe_util
 from streamlit.components.v1.custom_component import CustomComponent
 from streamlit.connections import SQLConnection
 from streamlit.errors import (
@@ -74,6 +76,10 @@ from tests.testutil import create_mock_script_run_ctx, create_pep649_function
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
+
+    from streamlit.runtime.scriptrunner_utils.parallel_fragment_stats import (
+        ParallelFragmentRunStats,
+    )
 
 MAC = "mac"
 UUID = "uuid"
@@ -895,6 +901,64 @@ def test_gather_metrics_records_time_when_rerun_exception_raised() -> None:
     assert ctx.shared.tracked_commands[0].time == metrics_util.to_microseconds(0.25)
 
 
+def test_listed_command_time_goes_to_the_threads_stats(
+    tracking_ctx: ScriptRunContext,
+) -> None:
+    """The thread's stats, which in a parallel fragment are the fragment run's,
+    get the time of its listed commands only.
+    """
+    timer_calls = iter([0.0, 0.25, 1.0, 2.0, 3.0, 3.5])
+
+    @metrics_util.gather_metrics("cmd")
+    def cmd() -> None:
+        pass
+
+    @metrics_util.gather_metrics("other_cmd")
+    def other_cmd() -> None:
+        pass
+
+    with (
+        patch.object(metrics_util, "_MAX_TRACKED_PER_COMMAND", 1),
+        patch("timeit.default_timer", side_effect=lambda: next(timer_calls)),
+    ):
+        with tracking_ctx.shared.parallel_fragments.recording_run() as run:
+            cmd()
+            # Past the per-command limit, so not listed.
+            cmd()
+        other_cmd()
+
+    assert len(tracking_ctx.shared.tracked_commands) == 2
+    assert run.stats.command_time == 0.25
+    assert tracking_ctx.shared.stats.current_thread_stats().command_time == 0.5
+
+
+def test_command_time_errors_dont_reach_the_caller(
+    tracking_ctx: ScriptRunContext,
+) -> None:
+    """A failure while recording a command's time leaves its result, or its
+    RerunException, unchanged.
+    """
+
+    @metrics_util.gather_metrics("cmd")
+    def cmd() -> int:
+        return 1
+
+    @metrics_util.gather_metrics("rerun_cmd")
+    def rerun_cmd() -> None:
+        raise RerunException(None)
+
+    with patch.object(
+        tracking_ctx.shared.stats,
+        "current_thread_stats",
+        side_effect=RuntimeError("bug"),
+    ) as record:
+        assert cmd() == 1
+        with pytest.raises(RerunException):
+            rerun_cmd()
+
+    assert record.call_count == 2
+
+
 def test_nested_commands_are_suppressed_in_the_same_context(
     tracking_ctx: ScriptRunContext,
 ) -> None:
@@ -1401,8 +1465,8 @@ def test_create_page_profile_message_reports_server_uptime() -> None:
 def test_create_page_profile_message_reports_cache_usage() -> None:
     """``cache_usage`` carries the run's totals per cache type, in microseconds."""
     ctx = create_mock_script_run_ctx()
-    stats = ctx.shared.cache_stats.current_thread_stats()
-    stats.open_call()
+    stats = ctx.shared.stats.current_thread_stats().cache
+    stats.open_call(0.0)
     stats.cache_data.calls = 3
     stats.cache_data.hits = 2
     stats.cache_data.misses = 1
@@ -1411,7 +1475,8 @@ def test_create_page_profile_message_reports_cache_usage() -> None:
     stats.cache_data.compute_time = 1.5
     stats.cache_data.wait_time = 0.25
     stats.cache_data.overhead_time = 0.001
-    stats.close_call()
+    stats.close_call(2.0, 1.751)
+    stats.async_overlap_time = 0.125
 
     with patch("streamlit.runtime.metrics_util.get_script_run_ctx", return_value=ctx):
         msg = metrics_util.create_page_profile_message([], 0, 0)
@@ -1426,6 +1491,7 @@ def test_create_page_profile_message_reports_cache_usage() -> None:
     assert usage.cache_data.compute_time == 1_500_000
     assert usage.cache_data.wait_time == 250_000
     assert usage.cache_data.overhead_time == 1_000
+    assert usage.async_overlap_time == 125_000
 
 
 def test_create_page_profile_message_leaves_cache_usage_and_uptime_unset() -> None:
@@ -1439,6 +1505,128 @@ def test_create_page_profile_message_leaves_cache_usage_and_uptime_unset() -> No
 
     assert not msg.page_profile.HasField("cache_usage")
     assert not msg.page_profile.HasField("server_uptime_seconds")
+
+
+def _record_parallel_fragment_run(
+    ctx: ScriptRunContext,
+    *,
+    command_time: float = 0.0,
+    compute_time: float = 0.0,
+    wait_time: float = 0.0,
+    async_overlap_time: float = 0.0,
+) -> ParallelFragmentRunStats:
+    """Record a finished parallel fragment run with one cached call of each type."""
+    with ctx.shared.parallel_fragments.recording_run() as run:
+        thread_stats = ctx.shared.stats.current_thread_stats()
+        thread_stats.command_time = command_time
+        stats = thread_stats.cache
+        stats.async_overlap_time = async_overlap_time
+        stats.cache_data.calls = 1
+        stats.cache_data.compute_time = compute_time
+        stats.cache_data.overhead_time = 0.001
+        stats.cache_resource.calls = 1
+        stats.cache_resource.wait_time = wait_time
+        stats.cache_resource.overhead_time = 0.001
+    return run
+
+
+def test_create_page_profile_message_reports_parallel_fragments() -> None:
+    """Each parallel fragment run reports its own times, in microseconds."""
+    ctx = create_mock_script_run_ctx()
+    run_start = time.perf_counter()
+    first = _record_parallel_fragment_run(
+        ctx, command_time=0.25, compute_time=1.5, async_overlap_time=0.125
+    )
+    second = _record_parallel_fragment_run(ctx, wait_time=0.5)
+    ctx.shared.parallel_fragments.add_wait_time(0.75)
+
+    with patch("streamlit.runtime.metrics_util.get_script_run_ctx", return_value=ctx):
+        msg = metrics_util.create_page_profile_message([], 0, 0, run_start=run_start)
+
+    usage = msg.page_profile.parallel_fragment_usage
+    assert usage.run_count == 2
+    assert usage.wait_time == 750_000
+    assert not usage.HasField("overflow")
+    first_entry, second_entry = usage.runs
+    assert first_entry.start_time == metrics_util.to_microseconds(
+        first.start - run_start
+    )
+    assert second_entry.start_time >= first_entry.start_time
+    assert first_entry.exec_time == metrics_util.to_microseconds(
+        first.end - first.start
+    )
+    assert (first_entry.command_time, first_entry.cache_compute_time) == (
+        250_000,
+        1_500_000,
+    )
+    assert first_entry.cache_async_overlap_time == 125_000
+    assert second_entry.cache_wait_time == 500_000
+    assert second_entry.cache_async_overlap_time == 0
+    # Both cache types are combined.
+    assert second_entry.cache_overhead_time == 2_000
+    assert usage.cache_usage.cache_data.calls == 2
+    assert usage.cache_usage.cache_resource.calls == 2
+    assert usage.cache_usage.async_overlap_time == 125_000
+    assert msg.page_profile.cache_usage.cache_data.calls == 2
+    assert msg.page_profile.cache_usage.async_overlap_time == 125_000
+    assert second.end is not None
+
+
+def test_create_page_profile_message_adds_parallel_fragments_past_the_limit() -> None:
+    """Runs past the limit are added together into ``overflow``."""
+    ctx = create_mock_script_run_ctx()
+    run_start = time.perf_counter()
+    for command_time in (0.25, 0.5, 1.0):
+        _record_parallel_fragment_run(
+            ctx, command_time=command_time, async_overlap_time=command_time / 2
+        )
+
+    with (
+        patch("streamlit.runtime.metrics_util.get_script_run_ctx", return_value=ctx),
+        patch.object(metrics_util, "_MAX_PARALLEL_FRAGMENT_RUNS", 1),
+    ):
+        msg = metrics_util.create_page_profile_message([], 0, 0, run_start=run_start)
+
+    usage = msg.page_profile.parallel_fragment_usage
+    assert usage.run_count == 3
+    assert [entry.command_time for entry in usage.runs] == [250_000]
+    assert usage.overflow.command_time == 1_500_000
+    assert usage.overflow.cache_overhead_time == 4_000
+    assert usage.overflow.cache_async_overlap_time == 750_000
+    assert usage.overflow.start_time == 0
+    assert usage.cache_usage.cache_data.calls == 3
+
+
+def test_create_page_profile_message_reports_unfinished_parallel_fragment() -> None:
+    """A run still going when the profile is built counts up to then."""
+    ctx = create_mock_script_run_ctx()
+    run_start = time.perf_counter()
+    with (
+        ctx.shared.parallel_fragments.recording_run() as run,
+        patch("streamlit.runtime.metrics_util.get_script_run_ctx", return_value=ctx),
+    ):
+        msg = metrics_util.create_page_profile_message([], 0, 0, run_start=run_start)
+        built = time.perf_counter()
+
+    (entry,) = msg.page_profile.parallel_fragment_usage.runs
+    assert 0 < entry.exec_time <= metrics_util.to_microseconds(built - run.start)
+
+
+@pytest.mark.parametrize(
+    "run_start", [None, 0.0], ids=["without run_start", "without fragments"]
+)
+def test_create_page_profile_message_leaves_parallel_fragment_usage_unset(
+    run_start: float | None,
+) -> None:
+    """Unset when no parallel fragment ran, or without the run's start."""
+    ctx = create_mock_script_run_ctx()
+    if run_start is None:
+        _record_parallel_fragment_run(ctx)
+
+    with patch("streamlit.runtime.metrics_util.get_script_run_ctx", return_value=ctx):
+        msg = metrics_util.create_page_profile_message([], 0, 0, run_start=run_start)
+
+    assert not msg.page_profile.HasField("parallel_fragment_usage")
 
 
 def test_create_page_profile_message_sends_zero_uptime() -> None:
@@ -1770,3 +1958,130 @@ def test_create_page_profile_message_sets_installed_agents(
     ):
         msg = metrics_util.create_page_profile_message([], 0, 0)
     assert list(msg.page_profile.installed_agents) == detected
+
+
+def _arrow_payloads(deltas: list[Any]) -> list[bytes]:
+    """Return the Arrow payloads of the dataframe, table and Vega-Lite chart
+    elements in ``deltas``, as sent to the browser.
+    """
+    payloads: list[bytes] = []
+    for delta in deltas:
+        element = delta.new_element
+        element_type = element.WhichOneof("type")
+        if element_type in {"dataframe", "table"}:
+            payloads.append(getattr(element, element_type).arrow_data.data)
+        elif element_type == "vega_lite_chart":
+            chart = element.vega_lite_chart
+            payloads.extend(dataset.data.data for dataset in chart.datasets)
+            if chart.data.data:
+                payloads.append(chart.data.data)
+    return payloads
+
+
+def _arrow_rows(payload: bytes) -> int:
+    return pa.ipc.open_stream(payload).read_all().num_rows
+
+
+class PageProfileArrowBytesTest(DeltaGeneratorTestCase):
+    """``arrow_bytes`` reports the Arrow payloads that the run's elements sent."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        ctx = get_script_run_ctx()
+        assert ctx is not None
+        ctx.reset()
+        ctx.gather_usage_stats = True
+
+    def _arrow_bytes(self) -> int:
+        return metrics_util.create_page_profile_message(
+            [], 0, 0
+        ).page_profile.arrow_bytes
+
+    def test_reports_arrow_bytes_across_elements(self) -> None:
+        """Dataframes, data editors, tables and charts all count, each payload
+        once.
+        """
+        st.dataframe(pd.DataFrame({"a": range(10)}))
+        st.data_editor(pd.DataFrame({"a": range(20), "b": range(20)}))
+        st.table(pd.DataFrame({"a": range(3)}))
+        st.line_chart(pd.DataFrame({"a": range(500), "b": range(500)}))
+
+        payloads = _arrow_payloads(self.get_all_deltas_from_queue())
+        assert len(payloads) == 4
+        assert self._arrow_bytes() == sum(len(payload) for payload in payloads)
+
+    def test_a_new_run_counts_only_its_own_payloads(self) -> None:
+        """Resetting the context for a new run drops the previous run's bytes."""
+        ctx = get_script_run_ctx()
+        assert ctx is not None
+        st.dataframe(pd.DataFrame({"a": range(100)}))
+        ctx.reset()
+        st.dataframe(pd.DataFrame({"a": range(3)}))
+
+        payloads = _arrow_payloads(self.get_all_deltas_from_queue())
+        assert self._arrow_bytes() == len(payloads[-1])
+
+    def test_reports_zero_for_a_run_without_data(self) -> None:
+        """A run without Arrow payloads still sends ``arrow_bytes`` as 0."""
+        st.markdown("No data here")
+
+        msg = metrics_util.create_page_profile_message([], 0, 0)
+
+        assert msg.page_profile.HasField("arrow_bytes")
+        assert msg.page_profile.arrow_bytes == 0
+
+    def test_counts_nothing_while_usage_stats_are_off(self) -> None:
+        """No thread records Arrow bytes while usage stats are off."""
+        ctx = get_script_run_ctx()
+        assert ctx is not None
+        ctx.gather_usage_stats = False
+
+        st.dataframe(pd.DataFrame({"a": range(10)}))
+
+        stats = ctx.shared.stats.all_thread_stats()
+        assert all(thread.arrow_bytes == 0 for thread in stats)
+
+    def test_counts_payloads_from_attached_threads_toward_the_run(self) -> None:
+        """A thread attached with ``add_script_run_ctx`` records into its own
+        stats, which count toward the run's totals.
+        """
+        df = pd.DataFrame({"a": range(50)})
+        thread = threading.Thread(target=lambda: st.dataframe(df))
+        add_script_run_ctx(thread)
+        thread.start()
+        thread.join()
+
+        (payload,) = _arrow_payloads(self.get_all_deltas_from_queue())
+        assert self._arrow_bytes() == len(payload)
+
+    def test_ignores_payloads_serialized_outside_a_script_run(self) -> None:
+        """Payloads serialized on a thread without a ``ScriptRunContext``, such
+        as lazily loaded dataframe chunks, don't count toward any run.
+        """
+        df = pd.DataFrame({"a": range(10)})
+        thread = threading.Thread(
+            target=lambda: dataframe_util.convert_pandas_df_to_arrow_bytes(df)
+        )
+        with patch(
+            "streamlit.runtime.scriptrunner_utils.script_run_context._LOGGER"
+        ) as logger_mock:
+            thread.start()
+            thread.join()
+
+        assert self._arrow_bytes() == 0
+        # The missing context is expected, not a recording failure.
+        logger_mock.debug.assert_not_called()
+
+    def test_recording_failures_dont_reach_the_element(self) -> None:
+        """If recording raises, the element is still sent with its data."""
+        df = pd.DataFrame({"a": range(10)})
+        with patch(
+            "streamlit.runtime.scriptrunner_utils.run_stats.RunStats."
+            "current_thread_stats",
+            side_effect=RuntimeError("boom"),
+        ):
+            st.dataframe(df)
+
+        (payload,) = _arrow_payloads(self.get_all_deltas_from_queue())
+        assert _arrow_rows(payload) == 10
+        assert self._arrow_bytes() == 0
